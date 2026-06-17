@@ -84,8 +84,12 @@ consistent with them.
   and **`K` MUST fit the architectural register budget** (a handful of vregs,
   never the whole 32-entry file). `pto.vmi` does **not** spill a value to UB or
   synthesize a loop to cover a value larger than the register file — that is the
-  programmer's tiling. `K` surfaces only inside lowering, as the natural SIMD
-  fan-out (unrolled, not a tile loop) of one register-width value.
+  programmer's tiling. **Core profile constraint:** for the stable `pto.vmi`
+  surface, require `K <= 4` (at most `4 x VL` backing) and require `K` to be a
+  compile-time constant in lowered kernels. Lowering then emits a fully-unrolled
+  straight-line fan-out over those `K` regs (no runtime `expertCountLoops`
+  control loop). `K` remains a lowering-time property, not a user-visible
+  scheduling feature.
 
 - **P4 — Never silently mis-lower.** If an op cannot absorb the current layout,
   the *worst* legal action is to insert an explicit `.contiguous()`
@@ -184,6 +188,8 @@ Per-lane, dtype-uniform ops (`vadd`, `vmul`, `vmin`, `vsel`, `vcmps`, `vand`,
 `vcvt`-logical, …) emit one `pto.mi` op per physical reg under a full-stride
 predicate. **Layout passes through unchanged.** Broadcast operands are allowed
 (see R6): an operand whose cardinality along an axis is 1 is *replicate-read*.
+Under the P3 core profile (`K <= 4`, compile-time known), this fan-out is
+required to lower as fully-unrolled straight-line code.
 
 ### R2 — Mode producer: parity / half / width (Category B)
 
@@ -230,6 +236,8 @@ the reduction axis sits in the physical hierarchy (reg / VLane / lane):
   nVL (`L ∈ [1,8]`). Loop-carried partial-sum accumulation across the
   programmer's tile loop is **not** an nVL feature — the programmer writes that
   loop and uses the fold/reduce op in the body (P8).
+  For the P3 core profile (`K <= 4` and compile-time known), both options are
+  lowered as unrolled straight-line instruction sequences.
 
 - **R4c — Arg-reduce index offset.** For `vcmax/vcmin` (value+index), any
   cross-reg combine MUST add `k · lanes_per_reg` to reg-`k` indices before
@@ -453,6 +461,43 @@ the same `K`-iteration fan-out loop — **identical instructions, identical
 performance**, but the source no longer spells `shape`, `Brcb`, `B32_BLOCK_COUNT`
 offsets, or the `expertCountLoops` tail-mask loop.
 
+**Worked example — MXFP8/MXFP4 shared-exponent block reduce (the 256B-window win).**
+The A5 `TQuant` MX paths already process one 256-element `DINTLV_B16` window at
+a time, then collapse each 32-element block to one shared exponent / scale:
+
+```cpp
+// MXFP8: 8 block maxima per 256-element DINTLV_B16 window.
+ReduceMxB16AbsMaxFlat<scale_alg>(srcPtr, maxPtr, vl_count, total_elements_count);
+ExtractB8ExponentAndScaling(maxPtr, expPtr, scalingPtr, exp_loop_count, numGroups);
+
+// MXFP4: same 32-element block size, but each block feeds the E2M1 pack step.
+ReduceMxB16AbsMaxFlat<scale_alg>(srcPtr, maxPtr, vl_count, total_elements_count);
+ExtractE2M1ExponentAndScaling(maxPtr, expPtr, scalingPtr, exp_loop_count, numGroups);
+CalcQuantizedFP4E2M1Values_Half(srcPtr, scalingPtr, dstPtr, numGroups);
+```
+
+In `ops-nn/quant` the concrete inner kernel is the same shape: `vlds(...,
+DINTLV_B16)` loads a whole 256B register window into two physical regs, `vcgmax`
+(or `ReduceMaxWithDataBlock`) collapses the 32-element block, and `vbr` or
+`vdup` broadcasts the shared scale back into the block. For MXFP8, the source
+helpers explicitly say this is “2 VLs per iter (one DINTLV_B16 load)” and the
+2D path is only a row-stride variant of the same windowed reduction.
+
+The 2D nVL view is:
+
+```mlir
+%win   = pto.vmi.vlds %x_ub         : !pto.mi.ptr<bf16,ub> -> !pto.vmi.vreg<4 x 32 x bf16>
+%amax  = pto.vmi.vreduce_max %win   {axis = col}
+  : !pto.vmi.vreg<4 x 32 x bf16> -> !pto.vmi.vreg<4 x 1 x bf16>
+%scale = pto.vmi.vbr %amax          : !pto.vmi.vreg<4 x 1 x bf16> -> !pto.vmi.vreg<4 x 32 x bf16>
+```
+
+For `bf16` / `fp16`, a 256B physical vreg covers four 32-element blocks; for
+`fp32`, it covers two 32-element blocks. The `R` axis is therefore the number of
+32-element blocks resident in one 256B window, and the programmer still owns the
+outer loop when `R` grows beyond one physical reg. `pto.vmi` only hides the
+block-internal lane slicing and the scale broadcast, not the tiling schedule.
+
 **Open sub-questions** (carried to Section 6): non-power-of-two `C`, `C > E_v`
 (row spans multiple VLanes → 1.5D), and whether `R`-axis (cross-VLane) reduce
 is exposed or always materialized.
@@ -554,6 +599,8 @@ register budget per P3), one `pto.vmi` op fans out over exactly those `K` regs �
 this is just SIMD width, **not** a generated tile loop. E.g. dividing one row's
 register-resident expert vector by its (broadcast) sum:
 
+`pto.mi` / real-vreg style (explicit per-reg bookkeeping):
+
 ```cpp
 uint16_t expertCountLoops = (expertCount_ + repeatCount - 1) / repeatCount;  // = K (small)
 for (uint16_t j = 0; j < expertCountLoops; j++) {
@@ -564,6 +611,21 @@ for (uint16_t j = 0; j < expertCountLoops; j++) {
     DataCopy(addr + off, vreg0, mask);
 }
 ```
+
+Equivalent low-level `pto.mi` shape:
+
+```mlir
+%k = arith.constant K
+scf.for %j = 0 to %k step 1 {
+  %off = arith.addi %row_off, arith.muli %j, %vl
+  %m   = pto.mi.predicate.update_mask %remain
+  %x   = pto.mi.vlds %ub[%off] : !pto.mi.vreg<f32>
+  %y   = pto.mi.vdiv %x, %sum_bcast, %m : !pto.mi.vreg<f32>
+  pto.mi.vsts %y, %ub[%off], %m
+}
+```
+
+`pto.vmi` style (logical value first, layout inferred):
 
 ```mlir
 %v = pto.vmi.vlds %ub[%row]        : !pto.mi.ptr<f32,ub> -> !pto.vmi.vreg<E x f32>
@@ -576,6 +638,13 @@ value**. What disappears is the per-reg `UpdateMask`/offset bookkeeping — **no
 the programmer's outer loop over rows/tiles, which is still written by hand. If a
 row's expert vector exceeds the register budget, the programmer tiles it
 explicitly (P3, P8); `pto.vmi` never auto-generates that loop.
+
+In this A.1 class, data-path instructions are usually unchanged. Under the P3
+core profile (`K <= 4`, compile-time known), the fan-out is required to be
+fully unrolled, so runtime loop-control overhead for `expertCountLoops` is
+removed by construction. The main gain remains readability/safety; performance
+differences are primarily from this unrolling and second-order scheduling
+effects.
 
 ### A.2 Fold-then-reduce-then-broadcast (softmax row max, R4b + R6)
 
@@ -601,7 +670,9 @@ Duplicate(dupVreg, reduceVreg, mask);                           // broadcast bac
 
 `pto.as` picks R4b fold-then-reduce (cost model: `K-1` `Max` + `1` `ReduceMax`
 beats `K` partials + combine here) and fuses the `Duplicate`. **Same
-instructions.** The author stops choosing the reduce schedule by hand.
+instructions.** Under the P3 core profile (`K <= 4`), the fold/partial steps are
+emitted fully unrolled (no runtime `expertCountLoops` loop). The author stops
+choosing the reduce schedule by hand.
 
 ### A.3 Interleaved (value,index) load — DINTLV is layout, not user intent (R3)
 
