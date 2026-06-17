@@ -15,11 +15,35 @@ specifies *requirements and principles*, not a final lowering algorithm — the
 last two sections deliberately keep the inference and instruction-mapping
 choices open.
 
+**What `pto.vmi` is — and is not.** The A5 vector pipe is a SIMD machine with a
+small architectural vector register file (32 vregs). `pto.vmi` is a thin
+**register-level layout sugar**: it makes *crossing / interleaving / partial /
+parity / broadcast / in-register reduce* layout changes easy to write and read,
+on values that are **resident in a few physical registers**. It is explicitly
+**not**:
+
+- a tile/tensor compiler — it does **not** generate tiling loops, load/store
+  streaming, or double-buffering;
+- a large-tensor abstraction — a single `pto.vmi` value never exceeds the
+  register budget (P3); oversized data is tiled **by the programmer**;
+- an auto-scheduler — the programmer still owns loop structure, buffer
+  placement, and pipe scheduling. `pto.as` only chooses *local* layout /
+  instruction lowering (which interleave mode, which reduce realization), never
+  the schedule.
+
+The value is readability and the elimination of hand-written layout-token bugs
+for the **inner**, register-resident layout manipulation — not automation of the
+outer loop nest.
+
 [toc]
 
 ---
 
 ## Part 0 — Reading guide
+
+`pto.vmi` is a **register-level layout sugar**, not a tensor/tile compiler (see
+*What `pto.vmi` is — and is not* above). Read every rule below as operating on a
+register-resident value inside a loop body the programmer wrote.
 
 This document is layered so each part only depends on the ones above it:
 
@@ -55,19 +79,25 @@ consistent with them.
   compiler, has **zero runtime representation**, and only ever picks *which*
   `pto.mi` instructions are emitted.
 
-- **P3 — One logical value = K physical regs + a descriptor.** A logical
-  `L x T` is backed by `K = ceil(L · bitwidth(T) / 2048)` physical 256B vregs.
-  `K` is implementation detail; it surfaces only inside lowering.
+- **P3 — One logical value = K physical regs, register-resident.** A logical
+  `L x T` is backed by `K = ceil(L · bitwidth(T) / 2048)` physical 256B vregs,
+  and **`K` MUST fit the architectural register budget** (a handful of vregs,
+  never the whole 32-entry file). `pto.vmi` does **not** spill a value to UB or
+  synthesize a loop to cover a value larger than the register file — that is the
+  programmer's tiling. `K` surfaces only inside lowering, as the natural SIMD
+  fan-out (unrolled, not a tile loop) of one register-width value.
 
 - **P4 — Never silently mis-lower.** If an op cannot absorb the current layout,
   the *worst* legal action is to insert an explicit `.contiguous()`
   materialization. The compiler MUST NOT reinterpret interleaved bytes as
   contiguous (or vice versa) without a real data movement.
 
-- **P5 — Lowering is an optimization search, not a fixed recipe.** For most ops
-  there are several legal `pto.mi` realizations (e.g. reduce-as-fold vs
-  reduce-as-partial-sums). `pto.vmi` semantics fix the *result*, never the
-  instruction schedule. Section 6 enumerates the option spaces.
+- **P5 — Lowering is a *local* instruction-selection search, not a fixed
+  recipe.** For most ops there are several legal `pto.mi` realizations (e.g.
+  reduce-as-fold vs reduce-as-partial-sums) for a register-resident value.
+  `pto.vmi` semantics fix the *result*, never the loop/tile/buffer schedule —
+  the search is confined to picking instructions/layout for the value at hand.
+  Section 6 enumerates the option spaces.
 
 - **P6 — 1:1 degeneracy.** When `K = 1` and the descriptor is contiguous, every
   `pto.vmi` op lowers to exactly one `pto.mi` op with zero overhead. `pto.vmi`
@@ -82,7 +112,22 @@ consistent with them.
   contiguous path to the same interleave pattern (lazy unification) instead of
   forcing immediate materialization. If no legal common layout exists, insert an
   explicit `.contiguous()` before the blocking op (P4). The author still gets a
-  single logical view throughout (applies to squeeze/unique — see R5).
+  single logical view throughout (applies to squeeze/unique — see R5). This
+  inference stays **within the register-resident working set**; it never spans
+  or rewrites the programmer's loops. *Narrow exception:* when an nVL register is
+  manipulated purely as a **broadcast** value (R6), `pto.as` MAY do simple,
+  **independent loop peeling** of the broadcast read — only the obviously linear
+  cases (constant fan-out, no loop-carried dependence, monotone instruction-count
+  win) and **without** a complex cost model. Anything needing a cost trade-off
+  stays the programmer's call.
+
+- **P8 — Programmer owns the schedule; inference is local.** `pto.vmi` adds
+  *some* convenience inference (contiguous materialization, layout unification,
+  local reduce/interleave realization) but never decides tiling, loop bounds,
+  buffer allocation, or pipe ordering. Anything that would require synthesizing
+  a loop nest or streaming data through UB is **out of scope** and stays in the
+  programmer's hands. nVL ops are meant to be written *inside* the programmer's
+  loop body to express that body's layout manipulation readably.
 
 ---
 
@@ -108,13 +153,16 @@ provide the following, in this priority order.
   pressure, latency). The chosen option MUST be observationally equal to the
   logical semantics.
 
-- **C5 — Hoist & fuse.** Hoist loop-invariant `.contiguous()` out of loops;
-  fuse consecutive contiguous-required consumers to share one materialization;
-  keep per-physical-reg partial accumulators across loop iterations and only
-  fold at the end (see R4 partial-sum option).
+- **C5 — Fuse adjacent layout ops (local only).** Fuse consecutive
+  contiguous-required consumers so they share one materialization, and combine
+  back-to-back reduce+broadcast. `pto.as` does **not** move work across the
+  programmer's loops or synthesize accumulator loops; loop-carried schedules
+  (e.g. partial-sum accumulation across iterations) are written by the
+  programmer, who may use nVL ops inside the body (see R4 partial-sum option).
 
-- **C6 — Lazy layout unification before materialization.** Honor P7 by default,
-  but before inserting `.contiguous()`, attempt region-wide layout unification:
+- **C6 — Lazy layout unification before materialization (local).** Honor P7 by
+  default, but before inserting `.contiguous()`, attempt layout unification
+  **within the register-resident SSA region** (no loop synthesis or hoisting):
   propagate producer/consumer constraints backward and forward, pick a common
   legal descriptor for all Category-A paths, and materialize only at a true
   legality frontier (Category-C boundary or incompatible Category-B mode).
@@ -177,11 +225,11 @@ the reduction axis sits in the physical hierarchy (reg / VLane / lane):
     Fewest reduce ops; serial `vadd` dependency chain.
   - **Partial-then-combine:** `K× vcadd` (independent, good ILP) + a `K`-way
     scalar/tiny-vector combine tree.
-  - **Loop partial-sums (C5):** keep `K` per-reg accumulators across a loop and
-    fold/reduce once at the end — the "physical 2/4, logical 1" pattern: the K
-    partials are only made contiguous (via `vadd`) at the tail.
-  The choice is cost-model driven. The result is a degenerate small nVL
-  (`L ∈ [1,8]`).
+  The two are a **local** instruction-selection choice over the `K`
+  register-resident regs (no loop synthesis); the result is a degenerate small
+  nVL (`L ∈ [1,8]`). Loop-carried partial-sum accumulation across the
+  programmer's tile loop is **not** an nVL feature — the programmer writes that
+  loop and uses the fold/reduce op in the body (P8).
 
 - **R4c — Arg-reduce index offset.** For `vcmax/vcmin` (value+index), any
   cross-reg combine MUST add `k · lanes_per_reg` to reg-`k` indices before
@@ -207,7 +255,13 @@ the reduction axis sits in the physical hierarchy (reg / VLane / lane):
 > backing for the reduced value, replicated logically to nVL) without an
 > explicit interleave round-trip, as long as byte semantics at UB remain equal.
 
-### R5 — Squeeze / compaction: scan-with-carry over a ragged value (Category C, streamed)
+### R5 — Squeeze / compaction: scan-with-carry over a ragged value (Category C, streamed) — *experimental*
+
+> **Experimental.** This rule and the ragged register type (5.2) are a
+> forward-looking sketch, **not** part of the core `pto.vmi` surface. Squeeze
+> touches dynamic-length / data-dependent territory that borders on tile
+> streaming; it is kept here only to record the intended lowering, and may be
+> dropped or moved to a separate proposal.
 
 `vsqz/vusqz` compact predicate-active lanes to the front; the valid count is a
 **runtime scalar** (`SPR SQZN`). Requirements:
@@ -217,10 +271,10 @@ the reduction axis sits in the physical hierarchy (reg / VLane / lane):
 - Squeeze across K physical regs is a **sequential scan-with-carry**: squeeze
   reg `k`, append its survivors after reg `k-1`'s using the residual/unaligned
   store (`vstus/vstur`, which consume `SQZN`), threading the running count.
-- The op **returns the post-squeeze count** as an SSA `i32` so a producer can
-  store exactly the valid region and a **downstream stage can re-tile by static
-  nVL with a runtime loop trip count** (load `ceil(count / L_tile)` tiles, each
-  a compile-time-known nVL).
+- The op **returns the post-squeeze count** as an SSA `i32`. The **programmer**
+  uses it to store exactly the valid region and to write any downstream
+  re-tiling loop — `pto.vmi` does **not** synthesize that loop; each tile the
+  programmer loads is a compile-time-known nVL.
 - Per P7, squeeze stays decomposed in-register and only assembles the compact
   stream when it reaches UB.
 
@@ -282,7 +336,10 @@ R2/R3/R4 lowering.
   `L` granularity: f32/i32 → 64, f16/bf16/i16 → 128, i8 → 256.
 - `#layout` is normally omitted in source (filled by `pto.as`).
 
-### 5.2 Ragged register `!pto.vmi.vreg<? x T, #layout>` (dynamic length)
+### 5.2 Ragged register `!pto.vmi.vreg<? x T, #layout>` (dynamic length) — *experimental*
+
+> **Experimental.** Paired with R5; not part of the stable surface (see the R5
+> experimental note). Listed for completeness of the design space.
 
 - Produced by squeeze/compaction (R5). The **tile capacity** is static; the
   **valid count** is a runtime `i32` carried alongside the value.
@@ -294,9 +351,9 @@ R2/R3/R4 lowering.
       -> !pto.vmi.vreg<?xf32>, i32
   ```
 
-- A downstream stage re-tiles `%compact` by a **static nVL** with a **runtime
-  loop trip count** `ceil(%count / L_tile)` (R5). This keeps every load a
-  compile-time-known shape while the number of iterations is dynamic.
+- A downstream **programmer-written** loop re-tiles `%compact` by a static nVL
+  with trip count `ceil(%count / L_tile)`; `pto.vmi` does not synthesize it. Each
+  load stays a compile-time-known shape while the iteration count is dynamic.
 
 ### 5.3 2D hierarchical register `!pto.vmi.vreg<R x C x T, #layout>` (proposal)
 
@@ -440,18 +497,18 @@ Listed as questions + candidate options.
   ILP / greedy by op-table priority?)
 - **I2 — When to keep `broadcast` vs expand.** Cost threshold for replicate-read
   (R6) vs one-time materialize when a broadcast feeds many consumers.
-- **I3 — `.contiguous()` placement.** Hoisting/fusion policy (C5): how far to
-  hoist out of loops, when to fuse multiple Category-C consumers.
+- **I3 — `.contiguous()` placement (local).** When to fuse multiple Category-C
+  consumers to share one materialization, within a single register-resident
+  region. (No cross-loop hoisting — loop structure is the programmer's choice.)
 - **I4 — 2D inference.** Auto-detect when a 1D reduce over a small inner dim
   should be re-typed to a 2D VLane-packed layout (R4a) vs left 1D.
-- **I5 — Ragged re-tiling.** After a squeeze (R5), inferring the static tile
-  shape + runtime trip count for the consumer, and proving the count bound.
 
 ### 6.2 Instruction-mapping options
 
-- **M1 — Reduce realization (R4b).** fold-then-reduce vs partial-then-combine
-  vs loop-partial-sums. Pick by `K`, loop depth, ILP, and whether an arg-index
-  (R4c) is needed.
+- **M1 — Reduce realization (R4b).** fold-then-reduce vs partial-then-combine.
+  Pick by `K`, ILP, and whether an arg-index (R4c) is needed. (Local choice over
+  the `K` register-resident regs; no loop-carried accumulation — that's the
+  programmer's.)
 - **M2 — Fused reduce+broadcast.** `vcadd`+`vdup` fusion, and whether the
   broadcast result is kept as a `broadcast`-axis nVL or a real VL.
 - **M3 — Radix-4 widen staging (R2).** ordering of the two `INTLV`/`PART`
@@ -490,13 +547,15 @@ rewrite is purely a readability/safety win at equal performance (P6).
 
 Source: `moe_gating_top_k_softmax_fullload_generalized_regbase.h`.
 
-### A.1 The universal nxVL fan-out (every VF in the tree has this)
+### A.1 Register-width fan-out (one logical value, small `K`)
 
-Every loop of the shape "`(len + VL - 1)/VL` chunks, `UpdateMask` tail, body
-per chunk" **is** an nVL fan-out (R1). E.g. the softmax normalize divide:
+When a single logical value spans a few physical regs (small `K`, within the
+register budget per P3), one `pto.vmi` op fans out over exactly those `K` regs —
+this is just SIMD width, **not** a generated tile loop. E.g. dividing one row's
+register-resident expert vector by its (broadcast) sum:
 
 ```cpp
-uint16_t expertCountLoops = (expertCount_ + repeatCount - 1) / repeatCount;  // = K
+uint16_t expertCountLoops = (expertCount_ + repeatCount - 1) / repeatCount;  // = K (small)
 for (uint16_t j = 0; j < expertCountLoops; j++) {
     mask  = UpdateMask<int32_t>(precessExpert);          // tail predicate, by hand
     off   = rowOff + j * repeatCount;
@@ -512,9 +571,11 @@ for (uint16_t j = 0; j < expertCountLoops; j++) {
 pto.vmi.vsts %n, %ub[%row]         : !pto.vmi.vreg<E x f32>, !pto.mi.ptr<f32,ub>
 ```
 
-Lowering: exactly `K` × (`UpdateMask` + `vlds` + `vdiv` + `vsts`). **Same.**
-The `expertCountLoops` count, the `j*repeatCount` offset math, and the manual
-`UpdateMask` all disappear into the descriptor's `chunk`/`reg` axis.
+Lowering: `K` × (`vlds` + `vdiv` + `vsts`) for the `K` regs of **this one
+value**. What disappears is the per-reg `UpdateMask`/offset bookkeeping — **not**
+the programmer's outer loop over rows/tiles, which is still written by hand. If a
+row's expert vector exceeds the register budget, the programmer tiles it
+explicitly (P3, P8); `pto.vmi` never auto-generates that loop.
 
 ### A.2 Fold-then-reduce-then-broadcast (softmax row max, R4b + R6)
 
@@ -592,7 +653,9 @@ DataCopyUnAlignPost(yOutAddr, u0, 0);               // flush tail
 In nVL the widen is one `pto.vmi.vcvt` (no `part`/stage tokens), and the
 unaligned append is the lowering of an R5 squeeze/compaction store — the
 `UnalignReg u0` carry **is** the scan-with-carry state. The user writes a
-logical `vsqz` + `vsts`; `pto.as` emits the `DataCopyUnAlign`/`Post` pair.
+logical `vsqz` + `vsts`; `pto.as` emits the `DataCopyUnAlign`/`Post` pair. (The
+widen is core R2; the residual-append half relies on the **experimental** R5 —
+see its note.)
 
 Concrete shape-preserving example (`4 x 64` of `i8` widened to `i32`):
 
@@ -639,7 +702,9 @@ In every row the nVL form carries **no** `repeatCount`, `expertCountLoops`,
 `UpdateMask`, `B32_BLOCK_COUNT`, `DIST_DINTLV_B32`, `castTrait`, or `UnalignReg`
 in the source, yet `pto.as` is required (P6) to emit the same instruction
 stream. The win is readability and the impossibility of an interleave/tail-mask
-bug, not a different schedule.
+bug, not a different schedule. The `K`-loops below are the **register-resident
+fan-out** of one logical value (small `K`, P3) — not auto-generated tile loops;
+the programmer still writes any loop over rows/tiles (P8).
 
 ### A.6 Index generation broadcast (Arange + replicate-read, R1 + R6)
 
@@ -682,106 +747,30 @@ Lowering: `Arange` is Category A (R1), emitted once per chunk; `vdup` broadcasts
 the result across rows (R6 + M2) with replicate-reads, costing zero extra
 instructions. The `vadds` scalar add fans out normally. **Same as hand-written.**
 
-### A.7 Weighted accumulate (softmax-like): fold-then-reduce + fused broadcast-scale (R4b + R6 + M2)
+### A.7 Padded softmax core — mask + in-register reduce + broadcast (R1 + R4 + R6)
 
-The `moe_finalize_routing` VF accumulates K expert representations scaled by
-routing weights — the classic `Σ scale_k · (row_k + bias_k)`:
-
-```cpp
-// Setup phase: broadcast sum per chunk
-LocalTensor<T> outLocal;                                // accumulator nVL
-for (int k = 0; k < K; k++) {
-    T scalesVal = scalesLocal[k];
-    int32_t expertIdx = expertForSourceRow[k];
-    // Load row k
-    DataCopyPad(rowTmp, gmExpandedPermutedRows[idx[k]], ...);
-    DataCopyPad(biasTmp, gmBias[expertIdx], ...);
-    // Compute
-    Add(rowTmp, rowTmp, biasTmp, dataLen);              // row + bias, Category A (R1)
-    Muls(rowTmp, rowTmp, scalesVal, dataLen);           // row *= scale (scalar broadcast add, R6)
-    Add(outLocal[0], outLocal[0], rowTmp, dataLen);     // accumulate, Category A (R1)
-}
-```
+The layout-relevant part of `ComputeSoftmax` is the per-row max/sum reduce and
+the broadcast back — the rest is the programmer's row loop. One row, hand-written,
+folds the chunks for the max, reduces, broadcasts, subtract+exp; then the same
+for the sum and a broadcast-divide. In nVL only the layout-changing ops survive:
 
 ```mlir
-%acc = pto.vmi.vbr 0.0 : !pto.vmi.vreg<H x f32>
-for %k = 0 to K {
-    %s_k = scf.extract scales[%k]                          // scalar
-    %row = pto.vmi.vlds(perm_ub[idx[k]])                   // load row k → nVL
-    %bias = pto.vmi.vlds(bias_ub[expert[k]])               // load bias → nVL
-    %r_b = pto.vmi.vadd %row, %bias                        // Category A: fan-out ×K
-    %r_bs = pto.vmi.vmuls %r_b, %s_k                       // scalar mul: fused broadcast (R6/M2)
-    %acc = pto.vmi.vadd %acc, %r_bs                        // accumulate: Category A
-}
-pto.vmi.vsts %acc, out_ub[token]
-```
-
-Lowering: the K-iteration loop runs as-is (scalar loop). Inside, `vadd` + `vadd`
-(rows + bias, then accumulate) are both Category A fan-out; `vmuls` is a
-broadcast-scalar multiply recognized as R6/M2 fused, costing one `Muls` per
-physical reg + no gather overhead. **Identical to the hand-written loop.**
-
-### A.8 Padded load + mask + per-group reduce (R1 + mask propagation + R4a for VLane groups)
-
-The `ComputeSoftmax` VF loads (with padding), applies pointwise softmax, then
-computes per-row sums and broadcasts back for normalization:
-
-```cpp
-__VEC_SCOPE__ {
-    for (i = 0; i < rowLoops; i++) {
-        // Load chunk j with mask for tail elements
-        for (j = 0; j < expertCountLoops; j++) {
-            mask = UpdateMask<float>(expertCount_);
-            LoadOneTensorForDtypeT<T>(xAddr, vreg, mask, offset);
-            Max<MERGING>(reduceMid, reduceMid, vreg, mask);  // (K-1) folds for per-row max
-        }
-        ReduceMax(reduceVreg, reduceMid, mask);              // 1 reduce (R4b)
-        Duplicate(dupVreg, reduceVreg, mask);               // broadcast max (R6)
-        // Subtract and exp per chunk
-        for (j = 0; j < expertCountLoops; j++) {
-            LoadOneTensorForDtypeT(xAddr, vreg0, mask, offset);
-            Sub(vreg0, vreg0, dupVreg, mask);                // Category A: fan-out
-            Exp(vreg0, vreg0, mask);                         // Category A: fan-out
-        }
-    }
-}
-// Compute row sums and normalize
-ReduceSum<float, Pattern::Reduce::AR>(reduceValue, softmax, tmp, shape, true);
-Brcb(tmp, reduceValue, ...);                                // broadcast per-row sum
-__VEC_SCOPE__ {
-    for (i = 0; i < rowLoops; i++) {
-        DataCopy(sumVreg, sumTensorAddr + i*BLOCK_COUNT);
-        Duplicate(sumVreg, sumVreg, mask);                  // broadcast sum
-        for (j = 0; j < expertCountLoops; j++) {
-            DataCopy(vreg0, softmaxAddr + offset);
-            Div(vreg0, vreg0, sumVreg, mask);               // broadcast divide (R6)
-        }
-    }
-}
-```
-
-```mlir
-%x = pto.vmi.vlds %x_ub[row]  : !pto.vmi.vreg<E x T>
-%x_pad = pto.vmi.vsel %mask, %x, neginf  // mask + pad, Category A + predicate
-%amax = pto.vmi.vreduce_max %x_pad  // R4b: fold-then-reduce
-%amax_b = pto.vmi.vbr %amax         // R6 + M2: broadcast
-%exp = pto.vmi.vexp (pto.vmi.vsub %x_pad, %amax_b)  // Category A fan-out
-
-%sum = pto.vmi.vreduce_add %exp (2D version)  // R4a if 2D, else R4b
-%sum_b = pto.vmi.vbr %sum                     // broadcast sum
-%norm = pto.vmi.vdiv %exp, %sum_b             // broadcast divide (R6)
+%x     = pto.vmi.vlds %x_ub[row]             : !pto.vmi.vreg<E x f32>
+%xpad  = pto.vmi.vsel %mask, %x, -inf         // tail mask + pad (R1 + predicate)
+%amax  = pto.vmi.vreduce_max %xpad            // R4b fold-then-reduce
+%amaxb = pto.vmi.vbr %amax                    // R6 broadcast
+%exp   = pto.vmi.vexp (pto.vmi.vsub %xpad, %amaxb)
+%sum   = pto.vmi.vreduce_add %exp             // R4a (2D) or R4b
+%sumb  = pto.vmi.vbr %sum                     // R6 broadcast
+%norm  = pto.vmi.vdiv %exp, %sumb             // R1 fan-out
 pto.vmi.vsts %norm, %y_ub[row]
 ```
 
-Lowering: load → pad/mask (Category A); fold-then-reduce + broadcast (R4b+R6)
-for max-subtract-exp; per-row reduce+broadcast (R4a or R4b depending on layout);
-final normalize divide with broadcast (R6). Compared to the hand-written code,
-the `UpdateMask` logic, `repeatCount`, `BLOCK_COUNT` arithmetic, and the
-explicit `Duplicate` calls all collapse into the descriptor. The `ReduceSum AR`
-+ `Brcb` step is inferred as R4a+R6 when the 2D type is recognized. **Same
-instructions, cleaner intent.**
+Lowering is the same `ReduceMax`/`Brcb`/`ReduceSum`/`Duplicate` instructions; the
+`UpdateMask`, `repeatCount`, and `BLOCK_COUNT` offset math collapse into the
+descriptor. The outer row loop stays hand-written (P8).
 
-### A.9 Summary table (extended)
+### A.8 Summary table (extended)
 
 | VF pattern (AscendC `MicroAPI`) | nVL surface | Lowers to | Rule | Kernel source |
 |---|---|---|---|---|
@@ -791,16 +780,15 @@ instructions, cleaner intent.**
 | `DataCopy<DIST_DINTLV_B32>(val,idx)` | `vlds → (val,idx)` SoA | same DINTLV | R3 | sorted KV read |
 | `Cast<i32,i8>` widen + `DataCopyUnAlign/Post` | `vcvt`, `vsqz`+`vsts` | same | R2, R5 | hasFinished+squeeze |
 | `Arange per chunk + replicate via nested loop` | `vdup(vmi.arange)` + replicate broadcast | Arange ×1 + replicate-reads | R1+R6 | InitIndices |
-| `K-iteration: Load + Add + Muls (scalar) + Add` | `for-loop{ vlds + vadd + vmuls + vadd }` | K iterations with R6 scalar mul | R1+R6/M2 | finalize_routing |
 | `UpdateMask + fold-reduce-max + subtract-exp + ReduceSum + Brcb + normalize-divide` | mask+pad + vreduce_max + vexp + vreduce_add + normalize | same reduce+bcast+divide steps | R1+R4b+R4a+R6 | ComputeSoftmax |
 
 In every row the nVL form carries **no** `repeatCount`, `expertCountLoops`, `UpdateMask`, `B32_BLOCK_COUNT`, `DIST_DINTLV_B32`, `castTrait`, or `UnalignReg` in the source, yet `pto.as` is required (P6) to emit the same instruction stream. The win is readability, elimination of interleave/mask arithmetic bugs, and explicit layout intent at the call site.
 
-### A.10 `pto.vmi` vs normal `pto.mi`/real-vreg mapping — benefit summary
+### A.9 `pto.vmi` vs normal `pto.mi`/real-vreg mapping — benefit summary
 
 | Topic | Normal `pto.mi` / real vreg coding | `pto.vmi` with virtual layout | Net benefit |
 |---|---|---|---|
-| Tail/chunk handling | Author writes `repeatCount`, chunk loops, `UpdateMask` at every site | One logical op on nVL; chunking inferred | Less boilerplate, fewer off-by-one/tail bugs |
+| Per-register layout bookkeeping | Author writes `UpdateMask`, per-reg offset, interleave tokens at each site | nVL op carries the layout in its descriptor (tile loops stay hand-written) | Less boilerplate, fewer off-by-one/tail bugs — **no** loop auto-gen |
 | Layout tokens | Author manages `DIST_*`, `INTLV_*`, `PART_*`, `Bin_*` explicitly | Layout in descriptor; op surface stays logical | Lower cognitive load, safer refactor |
 | Mixed-layout operands | Manual choice: convert one side now vs keep mixed state | C6 lazy unification searches path first, materializes only at frontier | Fewer unnecessary interleave round-trips |
 | Reduce + broadcast | Hand-select fold order + duplicate/broadcast steps | R4+R6 classify and fuse; result can normalize to 1-VL backing | Same perf, clearer intent |
@@ -811,6 +799,6 @@ In every row the nVL form carries **no** `repeatCount`, `expertCountLoops`, `Upd
 
 Practical reading: `pto.mi` tells you **how bytes move now**; `pto.vmi` tells
 you **what vector meaning is**, and delegates byte movement choices to `pto.as`
-under explicit rules (P1–P7, C1–C7, R1–R6).
+under explicit rules (P1–P8, C1–C7, R1–R6).
 
 ---
