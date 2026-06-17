@@ -770,7 +770,110 @@ Lowering is the same `ReduceMax`/`Brcb`/`ReduceSum`/`Duplicate` instructions; th
 `UpdateMask`, `repeatCount`, and `BLOCK_COUNT` offset math collapse into the
 descriptor. The outer row loop stays hand-written (P8).
 
-### A.8 Summary table (extended)
+### A.8 Multi-dtype quant output — one `vcvt` vs hand-written cast chains + pack tokens (R2 + R3)
+
+Source: [quant/ascend_quant/op_kernel/arch35/ascend_quant_regbase.h](../../ops-nn/quant/ascend_quant/op_kernel/arch35/ascend_quant_regbase.h)
+`Compute()`. One `fp16/fp32 -> {fp8 | int8 | int4}` quant is written **once per
+output dtype** because each target has a different cast chain *and* a different
+store-distribution token. The body after `Muls`/`Adds` (scale, offset) is:
+
+```cpp
+// x: fp16 -> fp32 (load distribution must be spelled out)
+DataCopy<half, LoadDist::DIST_UNPACK_B16>(vregX, xLocalAddr + i*VL);
+Cast<float, half, CAST_TRAIT_HALF_TO_FP32>(vregFloatX, vregX, mask);
+Muls(vregTmp1, vregFloatX, ATTR_SCALE, mask);
+Adds(vregFloatY, vregTmp1, ATTR_OFFSET, mask);
+
+if constexpr (IsSameType<U, fp8_e4m3fn_t>::value) {          // fp8: 1 cast
+    Cast<U, float, CAST_TRAIT_FP32_TO_FP8E4M3>(vregY, vregFloatY, mask);
+    DataCopy<U, StoreDist::DIST_PACK4_B32>(outLocalAddr + i*VL, vregY, mask);
+} else if constexpr (IsSameType<U, int8_t>::value) {        // int8: 3-stage chain
+    Cast<int16_t, float, CAST_TRAIT_FP32_TO_INT16>(vregInt16Y, vregFloatY, mask);
+    Cast<half, int16_t, CAST_TRAIT_INT16_TO_HALF>(vregHalfY, vregInt16Y, mask);
+    Cast<int8_t, half,  CAST_TRAIT_HALF_TO_INT8>(vregY, vregHalfY, mask);
+    DataCopy<U, StoreDist::DIST_PACK4_B32>(outLocalAddr + i*VL, vregY, mask);
+} else if constexpr (IsSameType<U, int4b_t>::value) {       // int4: chain + Pack + half-addr
+    Cast<int16_t, float, CAST_TRAIT_FP32_TO_INT16>(vregInt16Y, vregFloatY, mask);
+    Cast<half, int16_t, CAST_TRAIT_INT16_TO_HALF>(vregHalfY, vregInt16Y, mask);
+    Pack(vregTmp1Y, (RegTensor<uint32_t>&)vregHalfY);
+    Cast<int4x2_t, half, CAST_TRAIT_F16_TO_I8>(
+        (RegTensor<int4x2_t>&)vregTmp2Y, (RegTensor<half>&)vregTmp1Y, mask);
+    DataCopy<yCopyDtype, StoreDist::DIST_PACK4_B32>(
+        outLocalAddr + (i*VL/2), vregTmp2Y, mask4Int4);          // note: VL/2 stride, special mask
+}
+```
+
+Three hazards live in this source: the **cast radix chain** differs per dtype
+(`fp32->int16->half->int8`, and `int4` additionally needs `Pack` +
+`int4x2_t`), the **store token** `DIST_PACK4_B32` must match the packing, and
+int4 forces a **half-width address** (`i*VL/2`), a packed mask (`mask4Int4`),
+and a type alias (`yCopyDtype = int4b_t ? uint8_t : U`). Picking any one wrong
+is a silent corruption, not a compile error.
+
+In nVL the scale/offset/quant is dtype-agnostic and the cast is **one** op whose
+target type *is* the layout:
+
+```mlir
+%x  = pto.vmi.vlds %x_ub               : !pto.mi.ptr<f16,ub> -> !pto.vmi.vreg<L x f16>
+%xf = pto.vmi.vcvt %x                   : !pto.vmi.vreg<L x f16> -> !pto.vmi.vreg<L x f32>
+%s  = pto.vmi.vmuls %xf, %scale         : !pto.vmi.vreg<L x f32>
+%q  = pto.vmi.vadds %s,  %offset        : !pto.vmi.vreg<L x f32>
+%y  = pto.vmi.vcvt %q                    : !pto.vmi.vreg<L x f32> -> !pto.vmi.vreg<L x U>  // U = fp8|int8|int4
+pto.vmi.vsts %y, %y_ub                  : !pto.vmi.vreg<L x U>
+```
+
+Lowering (R2 width radix + R3 packing-is-layout): `pto.as` expands the single
+`vcvt %q : f32 -> U` into the dtype-specific cast chain and selects the matching
+store distribution — `DIST_PACK4_B32` for fp8/int8, and for int4 the
+`Pack` + `int4x2_t` cast + `i*VL/2` address + `mask4Int4`. The descriptor of
+`vreg<L x int4>` already encodes 2-per-byte packing, so the half-width address
+and packed mask are **derived**, not authored. Same instruction stream; the
+`if constexpr` ladder over output dtype disappears from the source.
+
+### A.9 MX block-scale — deinterleave load + exponent reduce + scale broadcast (R3 + R4b + R6)
+
+Source: [quant/dynamic_mx_quant/op_kernel/arch35/dynamic_mx_quant_tail_axis.h](../../ops-nn/quant/dynamic_mx_quant/op_kernel/arch35/dynamic_mx_quant_tail_axis.h)
+`ComputeMaxExp()`. To get a per-32-element MX shared exponent, the kernel loads
+adjacent `bf16/fp16` elements **deinterleaved** into two registers, masks out the
+exponent field, takes the block max, then writes the reduced scale back with an
+unaligned carry:
+
+```cpp
+for (i = 0; i < LoopNum2VF; i++) {
+    // load distribution: split interleaved B16 into two regs
+    Reg::LoadAlign<T, POST_MODE_UPDATE, LoadDist::DIST_DINTLV_B16>(
+        vdExp0, vdExp1, xLocalAddr, vfLen16Double);
+    Reg::And(vdExpExtract0, (RegTensor<uint16_t>&)vdExp0, expMaskBF16, Mask);   // extract exponent
+    Reg::And(vdExpExtract1, (RegTensor<uint16_t>&)vdExp1, expMaskBF16, Mask);
+    Reg::Max(vdMaxExp, vdExpExtract0, vdExpExtract1, Mask);                     // fold the two regs
+    Reg::ReduceMaxWithDataBlock(vdMaxExp, vdMaxExp, Mask);                      // block reduce
+    Reg::StoreUnAlign<uint16_t, POST_MODE_UPDATE>(
+        maxExpAddr, vdMaxExp, ureg, elementAfterReduce_);                       // scan store w/ carry
+}
+Reg::StoreUnAlignPost(maxExpAddr, ureg, 0);
+```
+
+The `DIST_DINTLV_B16` is **layout, not intent** (same class as A.3): the author
+only wants "max exponent over each block". The two-register fold + block reduce is
+the order-insensitive reduce of R4b, and the `StoreUnAlign`/`Post` carry is the
+R5 scan store. In nVL:
+
+```mlir
+%x      = pto.vmi.vlds %x_ub                : !pto.mi.ptr<bf16,ub> -> !pto.vmi.vreg<2*B x bf16>
+%exp    = pto.vmi.vand %x, %exp_mask         : !pto.vmi.vreg<2*B x u16>     // exponent field
+%maxe   = pto.vmi.vreduce_max %exp           : -> !pto.vmi.vreg<? x u16>     // per-block (R4b)
+%scaleb = pto.vmi.vbr %maxe                  : -> !pto.vmi.vreg<2*B x u16>   // broadcast (R6)
+```
+
+Lowering (R3 + R4b + R6): the logical `vlds` of a `2*B` block is realized with
+`DIST_DINTLV_B16` into the two physical regs; the `vreduce_max` keeps the
+hand-written `Max` + `ReduceMaxWithDataBlock` fold (P6); the `vbr` reuses the
+block layout to broadcast the shared scale back over the 32 elements. The
+author never names `DINTLV`, `expMaskBF16` register staging, `elementAfterReduce_`,
+or the `UnalignReg` carry — those are descriptor-derived. Same instructions; the
+deinterleave/carry bookkeeping leaves the source.
+
+### A.10 Summary table (extended)
 
 | VF pattern (AscendC `MicroAPI`) | nVL surface | Lowers to | Rule | Kernel source |
 |---|---|---|---|---|
@@ -781,10 +884,12 @@ descriptor. The outer row loop stays hand-written (P8).
 | `Cast<i32,i8>` widen + `DataCopyUnAlign/Post` | `vcvt`, `vsqz`+`vsts` | same | R2, R5 | hasFinished+squeeze |
 | `Arange per chunk + replicate via nested loop` | `vdup(vmi.arange)` + replicate broadcast | Arange ×1 + replicate-reads | R1+R6 | InitIndices |
 | `UpdateMask + fold-reduce-max + subtract-exp + ReduceSum + Brcb + normalize-divide` | mask+pad + vreduce_max + vexp + vreduce_add + normalize | same reduce+bcast+divide steps | R1+R4b+R4a+R6 | ComputeSoftmax |
+| `Muls/Adds + per-dtype Cast chain + DIST_PACK4_B32 (+Pack/int4x2_t/VL/2 for int4)` | `vmuls`+`vadds`+ one `vcvt f32->U` | same cast chain + pack token, descriptor-derived | R2+R3 | ascend_quant `Compute` |
+| `DIST_DINTLV_B16 + And(expMask) + Max + ReduceMaxWithDataBlock + StoreUnAlign` | `vlds`+`vand`+`vreduce_max`+`vbr` | same DINTLV + block reduce + carry store | R3+R4b+R6 | mx_quant `ComputeMaxExp` |
 
-In every row the nVL form carries **no** `repeatCount`, `expertCountLoops`, `UpdateMask`, `B32_BLOCK_COUNT`, `DIST_DINTLV_B32`, `castTrait`, or `UnalignReg` in the source, yet `pto.as` is required (P6) to emit the same instruction stream. The win is readability, elimination of interleave/mask arithmetic bugs, and explicit layout intent at the call site.
+In every row the nVL form carries **no** `repeatCount`, `expertCountLoops`, `UpdateMask`, `B32_BLOCK_COUNT`, `DIST_DINTLV_B32`, `DIST_PACK4_B32`, `castTrait`, `int4x2_t`, `Pack`, or `UnalignReg` in the source, yet `pto.as` is required (P6) to emit the same instruction stream. The win is readability, elimination of interleave/mask/pack arithmetic bugs, and explicit layout intent at the call site.
 
-### A.9 `pto.vmi` vs normal `pto.mi`/real-vreg mapping — benefit summary
+### A.11 `pto.vmi` vs normal `pto.mi`/real-vreg mapping — benefit summary
 
 | Topic | Normal `pto.mi` / real vreg coding | `pto.vmi` with virtual layout | Net benefit |
 |---|---|---|---|
@@ -794,6 +899,8 @@ In every row the nVL form carries **no** `repeatCount`, `expertCountLoops`, `Upd
 | Reduce + broadcast | Hand-select fold order + duplicate/broadcast steps | R4+R6 classify and fuse; result can normalize to 1-VL backing | Same perf, clearer intent |
 | Packed AoS access (`k/v`) | Manual deinterleave and pointer arithmetic | One packed-load contract + `getfield(k/v)` | Structure-aware readability, same instructions |
 | 1B→4B widen | Manual staging details and part/interleave reasoning | One `vcvt` at source, shape-preserving (`4x64 -> 4x64`) | Type-level clarity, staging hidden |
+| Multi-dtype quant cast (fp8/int8/int4) | Per-dtype cast chain + `DIST_PACK4_B32` + int4 `Pack`/`int4x2_t`/`VL/2`/special mask, hand-matched | One `vcvt f32->U`; target dtype *is* the layout, packing descriptor-derived | `if constexpr` dtype ladder removed; silent-corruption hazards eliminated |
+| Block-scale exponent reduce (MX) | `DIST_DINTLV_B16` deinterleave + exponent mask staging + carry store, all explicit | `vlds`+`vand`+`vreduce_max`+`vbr`; deinterleave is layout (R3) | Intent ("block max exponent") on the surface, staging hidden |
 | Squeeze append | Manual `UnalignReg` carry threading | `vsqz` + `vsts` logical op, carry in lowering | Easier correctness for ragged paths |
 | Performance parity | Achieved by hand tuning | Required by P6 (1:1 degeneracy and equal lowering choices) | Maintainability without perf loss |
 
