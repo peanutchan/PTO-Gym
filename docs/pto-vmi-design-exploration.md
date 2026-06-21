@@ -370,8 +370,8 @@ data axis / transform      data op                 predicate companion op
 parity (16→32 widen)       vcvt PART_EVEN/ODD       ppack PART=LOWER/HIGHER  (keep parity bit)
 parity → contiguous (load) vlds DINTLV_B*           pdintlv_b*               (split governing pred)
 parity → contiguous (store)vsts INTLV_B*            pintlv_b*                (merge governing pred)
-width (8↔32)               vpack / vunpack          ppack / punpack stacked  (radix-4 = 2 stages)
-widen needs a wider pred   (b16 data → b32 data)    punpack  (zero-extend 1-bit elem → 2-bit group)
+width (16↔32, radix-2)     vcvt PART_EVEN/ODD       ppack / punpack          (one radix-2 step)
+width (8↔32, radix-4)      see 4.6 — NO radix-4 predicate op needed (load/store dist carries the spread)
 half (Bin_N0/N1)           chistv2 Bin_N*           per-half predicate (PAT_ALL each, usually)
 tail                       plt/pge                  per-reg tail predicate; full regs use PAT_ALL
 ```
@@ -448,16 +448,77 @@ the per-half predication, and the interleave-on-store (`pintlv`) are all derived
 Budget: 2 vregs (e/o) + 1 (a) live; pregs `%pE,%pO` (`%p` dies after the cvt) → 2
 pregs. Per-reg fusion of the `vcvt+vadd` chain would keep it at 1 each.
 
-### 4.6 Open issues (predicates)
+### 4.6 The b8 ↔ b32 (radix-4) case — no radix-4 predicate op, no UB roundtrip
+
+A natural worry: A5 has only **radix-2** predicate reshape ops (`ppack`/`punpack`,
+`pintlv`/`pdintlv`), so a 1↔4 width change (b8↔b32, i.e. `i8/u8 ↔ i32/f32`) seems
+to need either a stacked predicate chain or — worse — a store+load roundtrip
+through UB (extra latency + scratch). **It does not.** The `TCvt.hpp` reference
+mapping does both directions register-resident, because the 1↔4 *lane spread* is
+carried by the **data load/store distribution** (`UNPK_B*` / `PK4_B32`) or a
+**`vselr` byte-gather**, not by predicate ops. The predicate then only ever
+crosses a single radix-2 step.
+
+A5 does expose native radix-4 *data* part modes (`vcvt PART_P0..P3`, the `Part_T`
+token family) and the `PK4_B32` packed store ("extract lower 8 bits"), `UNPK_B8`
+unpack load, plus `vintlv`/`vselr` register shuffles — these absorb the 4:1 / 1:4.
+
+**b8 → b32 widen** (`cast8to32_1D_NoPostUpdate`): the spread comes from the load
+distribution + `vintlv`; the predicate is **one `punpack`**.
+
+```mlir
+// data: UNPK_B8 load + interleave-with-zero + radix-4 part convert
+%x   = pto.vlds %src[%i], "UNPK_B8"          : !pto.ptr<u8,ub> -> !pto.vreg<256xu8>
+%a,%b = pto.vintlv %x, %zero                  : ...            // spread bytes
+%o0  = pto.vcvt %a, %p8 {part="P0"}          : -> !pto.vreg<64xi32>
+%o1  = pto.vcvt %b, %p8 {part="P0"}          : -> !pto.vreg<64xi32>
+// predicate companion: ONE radix-2 bit-extend, b16 -> b32 (NOT stacked, NOT a roundtrip)
+%p32 = pto.punpack %p16 {part="LOWER"}        : !pto.mask<b16> -> !pto.mask<b32>
+pto.vsts %o0, %dst[..], "NORM_B32", %p32
+```
+
+**b32 → b8 narrow** — two register-resident options, pick by destination:
+
+```mlir
+// Option 1 (straight to UB): single packed store, predicate stays b32. Cheapest.
+pto.vsts %y, %dst[%i], "PK4_B32", %p32        : !pto.vreg<64xi32>, !pto.ptr<i8,ub>, !pto.mask<b32>
+
+// Option 2 (cast32to8_1D, register path): low-byte extract + index byte-gather.
+%lo  = pto.vcvt %x, %p32 {part="P0"}          : !pto.vreg<64xi32> -> !pto.vreg<256xi8>
+%idx = ...                                     // vci + vmuls 4  -> [0,4,8,...]
+%pk  = pto.vselr %lo, %idx                     : gather low bytes contiguous
+pto.vsts %pk, %dst[%i], "NORM_B8", %p8         // plain b8 predicate
+```
+
+**Cost model entries (not a roundtrip, but not free):**
+
+- one setup vreg each way: a zero-vec for `vintlv` (widen) / an index-vec via
+  `vci`+`vmuls` for `vselr` (narrow);
+- `vselr` is a gather (heavier than `PK4_B32`) — prefer the `PK4_B32` packed store
+  when the destination is contiguous UB;
+- a `mem_bar(VST_VST)` on the `vselr` narrow path;
+- **no extra UB scratch** in the 1D contiguous fast path.
+
+**When a roundtrip *does* appear:** only if a b8↔b32 value needs a register-resident
+*contiguous logical view* and **no** load/store distribution applies (a true
+Category-C consumer). Then `.contiguous()` is the store+load, exactly as P4
+intends — but the ordinary "load-then-widen" and "narrow-then-store" flows never
+hit it. So the radix-4 predicate gap is a **non-problem** for the common mapping;
+it only constrains the rare register-resident-contiguous case.
+
+### 4.7 Open issues (predicates)
 
 - **O-P.1** Is `mask<L x G>` a first-class logical type with its own descriptor, or
   is the predicate always *derived* from the data value it governs at lowering?
 - **O-P.2** When a data-dependent mask (`vcmp` result) crosses a parity axis, do we
   recompute the compare per parity reg, or `ppack` the b32 result? (Recompute may be
   cheaper than holding variants under the 8-reg budget.)
-- **O-P.3** `punpack` zero-extends — for a *widen of an active-lane* mask we want
-  the upper bit of the 2-bit group to mirror, not zero. Confirm the exact
-  `ppack/punpack` recipe per widen radix (2 vs 4) against hardware.
+- **O-P.3** Radix-4 (b8↔b32) is **resolved** (4.6): no radix-4 predicate op and no
+  UB roundtrip — the data distribution (`UNPK_B*`/`PK4_B32`) or `vselr` carries the
+  1↔4 spread and the predicate crosses a single `punpack`/`ppack`. Remaining check:
+  confirm `punpack PART=LOWER`'s LSB-of-2-bit-group semantics is exactly what the
+  widened b32 value needs (it is in `cast8to32_1D`, under ZEROING). Document the
+  `PK4_B32`-store vs `vselr`-gather choice in the cost model.
 - **O-P.4** Predicate pressure should enter the same cost model as vregs (Part 2);
   is a joint 32-vreg/8-preg allocator warranted, or a two-phase one?
 - **O-P.5** Half axis (`chistv2`) with *distinct* N0/N1 predicates (vs the current
