@@ -526,7 +526,131 @@ it only constrains the rare register-resident-contiguous case.
 
 ---
 
-## Part 5 — Consolidated open issues (new, for discussion)
+## Part 5 — Grouped 2D operation mapping, the broadcast asymmetry, and the nxVL cost model
+
+Part 1 established the 2D *type/view*. This part asks the operational question:
+**does a grouped 2D op force the same extra load/store the radix-4 case avoided?**
+The answer is asymmetric and is the reason a cost model is needed.
+
+### 5.1 Reduce is cheap; grouped broadcast is not
+
+- **Grouped reduce** (`vcgadd/vcgmax/vcgmin`) collapses each VLane in **one op per
+  reg**, no load/store, no scratch (the M-A / R4a win). Output = one partial per
+  VLane at lanes `0,8,16,…`.
+- The **reverse — grouped broadcast** (each VLane's partial fanned back across its
+  own lanes) has **no native single instruction**. This is the asymmetry you
+  flagged. Three realizations, each with a different cost shape:
+
+| Realization | Mechanism | Extra ld/st | Scratch | Throughput | Used by |
+|---|---|---|---|---|---|
+| **UB roundtrip** | `vsts` partials + `vlds BRC_BLK`/strided reload | +1 st +1 ld (~18c) | UB block | store-bound | MX example + the SPEC softmax example |
+| **`vselr` gather** | index reg (`vci`+`vmuls`) + `vselr` (`dst[i]=src[idx[i]]`) | none | 1 index vreg | **~4× lower than INTLV** (gather/permute class) | register fusion |
+| **masked recompute** | per-group full reduce / arithmetic under per-group masks | none | mask pregs | more ops, scales with #groups | small group count |
+
+- **Ungrouped** broadcast of a single reduced scalar is *not* in this trap: `vdup`
+  (lane→all, register, cheap) avoids any roundtrip. Note, though, that the SPEC's
+  own `pto.mi` softmax sample still uses `vcadd` → `vsts` + `vlds BRC_B32` (UB
+  roundtrip) rather than `vdup` — so even the ungrouped reduce+bcast is often a
+  roundtrip in hand-written code unless `vdup` is chosen deliberately.
+
+### 5.2 So: does grouped 2D have the extra ld/st issue?
+
+- **Reduce direction:** **no** — `vcg*` is one op/reg.
+- **Grouped broadcast direction:** **only if you pick the UB-roundtrip
+  realization.** `vselr` keeps it register-resident (pay ~4× throughput);
+  masked-recompute keeps it register-resident (pay op count/complexity). There is
+  **no universally best choice** — it depends on group count, `K`, surrounding
+  ops, and whether UB bandwidth or vector-issue is the bottleneck. Hence it must be
+  a **cost-model decision with a programmer escape hatch**, not a fixed rule.
+
+### 5.3 Consequence for `reduce + bcast + eltwise` fusion
+
+- **Without register fusion** (today's MX / requirements pattern): store the reduce
+  result to UB with a dist mode, reload broadcast, do the eltwise. Simple and
+  correct, but **2 extra ld/st per group-step + UB scratch**, and it breaks the
+  fused region (the store/load is a Category-C frontier).
+- **With register fusion**: the grouped broadcast must be materialized in-register
+  → `vselr` (throughput hit) or masked recompute (complexity). The budget model
+  (Part 2) interacts: the `vselr` index reg and the per-group masks consume the
+  vreg/preg budget, which can itself force a spill.
+
+This is exactly why "register fusion of reduce+bcast+eltwise is not simple": the
+bcast leg has no cheap grouped form, so the fuser must *choose*, and the choice
+needs numbers.
+
+### 5.4 The nxVL cost model (the vmi cost table)
+
+**Principle.** A vmi op's cost is derived from the ISA cost of the `pto.mi` ops it
+lowers to, times fan-out, plus any materialization and setup:
+
+```
+cost(vmi_op) ≈ fanout × Σ cost(lowered pto.mi ops)
+             + materialization (extra ld/st when a Category-C frontier is crossed)
+             + setup (index / zero / mask register construction)
+fanout = K (1D, reg-level) ;  grouped ops add a per-VLane factor handled by vcg*
+```
+
+**Base ISA latencies** (A5 CA simulator, `Ascend910_9599`; *simulator, not
+silicon* — values from SPEC §"Latency and throughput"):
+
+| Class | Representative op | Latency (cyc) | Throughput note |
+|---|---|---|---|
+| contiguous / unpack / deint / brc / pk load-store | `NORM`,`UNPK_B*`,`DINTLV_B*`,`BRC_B*`,`PK4_B32` | **9** | `vlds` dual-issue, or `vlds`+`vsts` 1+1 |
+| interleave store | `INTLV_B*` (`vstsx2`) | **12** | store-bound |
+| binary arith | `vadd` f32 | **7** | PIPE_V |
+| reduce | `vcadd`/`vcgadd`/`vcmax` | reduction-class¹ | one op per reg |
+| broadcast (reg) | `vdup` (lane→all) | reg-op¹ | cheap, no ld/st |
+| select/permute | `vselr` | permute/gather-class | **~4× lower thruput than INTLV** (reported) |
+| gather / scatter | `vgather2`/`vgatherb`/`vscatter` | **27–28 / ~21 / ~17** | `vgather2` ~0.1 op/cyc |
+
+¹ This SPEC rev does not publish a separate CA cycle for the reduce/`vdup` ops;
+treat them as single-issue PIPE_V (~order of the arith latency), one per reg.
+
+**Derived vmi cost table** (per logical value, `K` = reg fan-out):
+
+| vmi op / pattern | lowering | instr / value | extra ld/st | scratch | dominant cost |
+|---|---|---|---|---|---|
+| `vadd/vmul/vsel/...` (R1) | `K ×` arith | `K` | 0 | 0 | `K×7` |
+| `vcvt` 16↔32 (R2 parity) | `2K ×` `vcvt EVEN/ODD` + `ppack` pred | `2K` | 0 | 0 | parity widen |
+| `vcvt` 8↔32 (radix-4) | `UNPK/PK4` + `vcvt P0` (+`vselr` narrow) | ~2–3 | 0 (reg path) | index/zero reg | see §4.6 |
+| `vlds/vsts` contiguous | `K × 9` | `K` | — | 0 | bandwidth |
+| `vlds DINTLV` / `vsts INTLV` | `K ×` (9 / 12) | `K` | — | 0 | INTLV 12c |
+| `vreduce` grouped (R4a) | `K ×` `vcgadd` | `K` | 0 | 0 | **cheap** |
+| `vreduce` full (R4b) | `(K-1)` `vadd` + `vcadd` | `K` | 0 | 0 | fold chain |
+| **grouped `vbr` (the hard one)** | UB roundtrip **or** `vselr` **or** masked recompute | varies | UB option: +2 | index/mask | **decision point** |
+| ungrouped `vbr` (scalar) | `vdup` (reg) or `vlds BRC` | 1 | 0 (`vdup`) | 0 | cheap |
+| `vgather/vscatter` (C) | gather | — | — | index | 21–28c, ~0.1/cyc |
+
+### 5.5 Surfacing the cost to the programmer
+
+- **Decision log.** When `pto.as` lowers a `reduce+bcast+eltwise` group, it should
+  emit a one-line note of which broadcast realization it picked
+  (`ub-roundtrip` / `vselr` / `masked`) and why (the dominating cost term), so the
+  choice is auditable.
+- **Escape hatch.** Keep the RFC §6.1 `prefer_layout` hint as the override
+  (`hint = "contiguous" | "interleaved"`, plus a `bcast = "vselr" | "ub" | "mask"`
+  variant) — semantically inert, so a programmer who knows the bottleneck can pin
+  the realization without touching correctness.
+- **Per-op annotations.** Expose the §5.4 derived cost at the vmi level (an
+  attribute or query) so the programmer can reason *before* lowering, mirroring how
+  they reason about `__VEC_SCOPE__` instruction counts today.
+
+### 5.6 Open issues (grouped 2D / cost model)
+
+- **O-G.1** Grouped-broadcast realization thresholds: when does `vselr`'s ~4×
+  throughput hit beat the UB roundtrip's +2 ld/st + scratch + sync? Calibrate vs
+  group count, `K`, and whether the loop is UB- or issue-bound.
+- **O-G.2** Add a first-class `vmi.group_bcast` op (so the realization is one
+  cost-model switch), or always decompose at lowering?
+- **O-G.3** Cost-model calibration: the numbers are simulator, not silicon, and per
+  SOC. How is the vmi table kept in sync with ISA-rev latency updates (generated
+  from the SPEC table)?
+- **O-G.4** Does the decision log / `prefer_layout` `bcast` hint belong on the op,
+  the region, or a kernel-level policy attribute?
+
+---
+
+## Part 6 — Consolidated open issues (new, for discussion)
 
 Carried from the parts above, plus the cross-cutting ones:
 
@@ -539,6 +663,13 @@ Carried from the parts above, plus the cross-cutting ones:
    spells a logical mask shape.
 5. **Op-table single-source** for MLIR + C++ headers (O-F.3) — to keep Option A and
    Option C from drifting (the MoE analysis §6 "axis enumeration drift" risk).
+6. **Grouped-broadcast realization** (O-G.1/O-G.2) — the only grouped-2D op with no
+   cheap native form; the cost model must pick UB-roundtrip vs `vselr` vs masked
+   recompute, and this is the gating difficulty for register-fusing
+   `reduce+bcast+eltwise`.
+7. **nxVL cost-model sourcing** (O-G.3) — generate the §5.4 vmi cost table from the
+   SPEC latency table so it tracks ISA revisions and SOC, and decide how/whether to
+   surface per-op cost + a decision log to the programmer (O-G.4).
 
 These are intentionally left open; the next discussion pass should pick a position
 on (1) and (4) first, since the load mapping and predicate-type choices gate the
