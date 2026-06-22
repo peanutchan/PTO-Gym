@@ -782,7 +782,77 @@ treat them as single-issue PIPE_V (~order of the arith latency), one per reg.
 
 ---
 
-## Part 6 — Consolidated open issues (new, for discussion)
+## Part 6 — Rules of thumb: writing efficient nxVL kernels
+
+The earlier parts show the lowering choices are **not symmetric** — some stay
+cheaply in registers, others are far cheaper through UB. This part distills that
+into defaults a programmer (and a first-cut `pto.as` heuristic) can apply without a
+full cost search. They are **defaults, not laws**: override via `prefer_layout` and
+the `#pto.vmi.tile` presets when you know the bottleneck.
+
+**The one principle.** *Register-fuse the cheap operations (elementwise chains,
+in-VLane reduce); route the expensive reshuffles (grouped broadcast, 1-byte width
+change, arbitrary permute) through UB at a fused-region boundary.* This is P7
+"decompose until UB" with a concrete list of what is "expensive enough to spill."
+
+### 6.1 Decision guide (default lowering per pattern)
+
+| Pattern | Default | Why |
+|---|---|---|
+| elementwise chain (R1) | **register-fuse**, per-reg loop (Part 2 lever 1) | ≈7c/op, pressure-bounded, no ld/st |
+| in-VLane group reduce (R4a) | **register** `vcgadd/vcgmax/vcgmin` | one op/reg, no ld/st |
+| **grouped reduce → broadcast → eltwise** | **UB roundtrip**: store packed partials → reload `BRC_BLK` → eltwise | no native grouped reg-bcast; `vselr` ~4× slower + index reg; `vsts`+`vlds` are 9c and pair on the 1+1 issue slot |
+| full reduce → scalar broadcast | `vcadd` then **`vdup`** (register) for a single scalar; UB `BRC` only if it must re-tile | `vdup` lane→all avoids a roundtrip |
+| parity widen/narrow 16↔32 | **register** `vcvt EVEN/ODD` *inside a fused A-region*; else UB | one radix-2 step + `ppack` pred (§4.5), cheap to keep register-resident |
+| **width change to/from 1B (8-bit)** | **UB**: widen-on-load (`UNPK_B*`), narrow-on-store (`PK4_B32`); compute in 2B/4B | A5 compute is 2B/4B; 1B is an IO/quant format; the dist spreads for free (9c) vs register `vselr`/`vintlv` staging |
+| arbitrary gather/scatter / cross-VLane (C) | **UB** / gather ops | no axis absorbs it; 21–28c gather |
+
+### 6.2 The two headline recommendations
+
+**RoT-1 — Grouped `reduce + bcast + eltwise`: go through UB, don't register-fuse the
+broadcast.** After a grouped reduce (`vcgadd`), **store the packed reduced result to
+UB, broadcast it back with a block-broadcast load (`BRC_BLK`), then do the
+elementwise step.** Use the register-resident `vselr` broadcast **only** when both
+the group count and `K` are tiny *and* the loop is vector-issue-bound (not
+UB-bandwidth-bound). Rationale: there is no native grouped register broadcast;
+`vselr` runs at ~4× lower throughput and burns an index reg, whereas the store +
+`BRC_BLK` reload are two 9-cycle ops that pair on the hardware's `vlds`+`vsts` (1+1)
+issue slot and free registers for the eltwise. This is exactly what the MX
+block-scale and softmax kernels already do — it is the efficient default, not a
+fallback.
+
+**RoT-2 — Don't pack to 1 byte in registers; let width changes ride UB.** A5 compute
+is natural at **4B (f32/i32) and 2B (f16/bf16/i16)**; **8-bit is an IO / quant
+boundary format**, not a compute width. So **widen on load (`UNPK_B*`), narrow on
+store (`PK4_B32`), and compute in 2B/4B.** Keep 1B values register-resident — or do
+register-level 4B↔1B packing — **only** when a layout change genuinely forces it
+(the rare register-resident-contiguous case in §4.6). Otherwise the width change
+costs one 9-cycle load/store distribution instead of `vselr`/`vintlv` register
+staging plus a setup reg. The same logic is why a 4B↔1B transform "usually won't be
+packed at register level": unless you need an in-register layout change, the UB
+boundary is both simpler and faster.
+
+### 6.3 Corollaries
+
+- **Fused-region boundaries = the expensive reshuffles.** Split a fused region at a
+  grouped broadcast, a 1B width change, an arbitrary gather, or a cross-VLane
+  reduce. *Inside* a region, fuse freely (elementwise + in-VLane reduce).
+- **`K = 1` contiguous is free (P6)** — use nxVL with no second thoughts.
+- **Spilling is not a failure.** Under the 32-vreg / 8-preg budget (Part 2), a UB
+  roundtrip at these boundaries is usually *faster* than fighting to stay
+  register-resident, because the vector pipe issues `vlds`+`vsts` together (1+1).
+- **Spill mask intermediates as the raw `NORM` image** (§4.7), never repacked.
+- **Pin with hints when the default is wrong:** `prefer_layout` and the
+  `#pto.vmi.tile` presets (§1.4.1) override the heuristic without touching
+  correctness.
+
+These rules of thumb should ship *with* the nxVL programming model (as a "skill" /
+best-practices page), so a kernel author reaches for the efficient lowering by
+default instead of discovering the asymmetries the hard way.
+
+---
+
+## Part 7 — Consolidated open issues (new, for discussion)
 
 Carried from the parts above, plus the cross-cutting ones:
 
