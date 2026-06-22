@@ -322,7 +322,9 @@ back over its lanes) is the hard case and lives in Group 7, not here.
 
 Pure Category-A, per-lane ops. Layout passes through unchanged; an operand whose
 cardinality along an axis is 1 is a broadcast (R6) and is replicate-read. Under
-the P3 core profile these fan out as fully-unrolled straight-line code.
+the P3 core profile these fan out as fully-unrolled straight-line code. Mixed
+operand cardinality (inferred broadcast) and mixed operand layout (auto-unify)
+are resolved automatically — see §7.1.
 
 | `pto.vmi` op(s) | Functional description | Datatypes | Layout | Mask in | `pto.vmi -> pto.mi` mapping | Cost (`#mi` / VL-util / note) |
 |---|---|---|---|---|---|---|
@@ -341,6 +343,99 @@ materialization — the register-fuse sweet spot (design-exploration §6.1: fuse
 elementwise chains per-reg). `vselr` is the exception: it is the permute/gather
 class and is the register-resident realization of a grouped broadcast (Group 7),
 so its cost is called out even though it is surface-eltwise.
+
+### 7.1 Operand compatibility, inferred broadcast, and layout defaults
+
+**Principle (why this exists).** When the inference is *unambiguous*, the author
+should not have to spell it out. A binary eltwise op (`vadd`, `vmul`, `vsub`,
+`vdiv`, `vmax`, `vmin`, `vand/vor/vxor`, `vsel`, …) accepts operands that differ
+in **cardinality** (one side broadcasts) or in **physical layout** (one side
+interleaved, one contiguous), and `pto.as` resolves both **automatically** —
+falling back to an explicit `.contiguous()` only when no legal common form
+exists (P4). A `prefer_layout` / `bcast` hint is available for the rare case
+where the default is wrong.
+
+There are **two independent** inference axes; do not conflate them:
+
+- **cardinality mismatch → inferred broadcast (R6).** The small operand carries
+  a `broadcast` axis (1 physical reg backing); it is *replicate-read*, never
+  expanded to `K` copies.
+- **layout mismatch (same cardinality) → lazy unification (C6/P7).** Both
+  operands are full size but in different physical layouts (e.g. parity vs
+  contiguous); `pto.as` retargets one to the other's layout, or materializes.
+
+#### 7.1.1 Inferred broadcast (cardinality 1 → replicate-read)
+
+`vadd(%a : nxVL, %b : broadcast)` is **allowed and is the default** — no
+`vbr`/`vdup` needs to be written by hand when `%b` already has a `broadcast`
+axis (produced by `vbr`, `vlds BRC_*`, or a reduce→bcast fusion). Lowering is
+`K × vadd`, each reusing `%b`'s single physical reg:
+
+```mlir
+%sum = pto.vmi.vreduce_add %x          : !pto.vmi.vreg<E x f32> -> !pto.vmi.vreg<1 x f32>
+%sb  = pto.vmi.vbr %sum                 : !pto.vmi.vreg<1 x f32> -> !pto.vmi.vreg<E x f32>  // broadcast axis
+%out = pto.vmi.vdiv %x, %sb             : !pto.vmi.vreg<E x f32>   // K × vdiv, %sb replicate-read
+```
+
+Legality requirements for the broadcast operand:
+
+- it MUST carry a `broadcast` axis (cardinality 1 along the fan-out dim, 1
+  physical reg) — a plain `K=1` full vector is **not** auto-broadcast against a
+  `K>1` value;
+- element type MUST match the other operand (insert a `vcvt` first otherwise);
+- in 2D, an `R x 1` value broadcasts across the `col` (lane) axis via `vdup`/
+  replicate-read; an `1 x C` value broadcasting across `row` is the ungrouped
+  case (cheap). The **grouped** per-VLane fan-back (`vbr {group=C}`) is *not*
+  this R6 case — it is the Group 7 decision (UB / `vselr` / masked).
+
+#### 7.1.2 Default behavior for mismatched layout (auto-unify)
+
+When both operands are full cardinality but in different layouts, the default
+(C6, no hint) is:
+
+1. **try to unify without data movement** — retarget the cheaper-to-move
+   producer to the other operand's `#layout` (e.g. load the contiguous side as
+   `DINTLV` so both are parity-split), so the op is a clean `K × vadd`;
+2. **if no legal common layout exists**, insert one `.contiguous()` on one
+   operand (store+reload, P4) and then `K × vadd`;
+3. a `broadcast` operand is exempt — it never needs to match the other side's
+   parity/half; it replicate-reads as-is.
+
+```mlir
+%a = ... : !pto.vmi.vreg<128 x i32, #parity>      // interleaved (e.g. from a widen)
+%b = ... : !pto.vmi.vreg<128 x i32, #contiguous>  // contiguous
+%c = pto.vmi.vadd %a, %b                            // default: unify %b -> #parity, then K × vadd
+```
+
+#### 7.1.3 What is allowed vs not (quick table)
+
+| Operand pattern | Default | Mechanism |
+|---|---|---|
+| nxVL + `broadcast` (1 reg) | **allowed**, replicate-read | R6 |
+| nxVL + scalar (`vadds`) | **allowed**, implicit broadcast | R6/M2 |
+| nxVL + nxVL, same layout | **allowed**, pass-through | R1 |
+| nxVL + nxVL, contiguous vs parity/half | **allowed**, auto-unify | C6/P7 |
+| nxVL + nxVL, no legal common layout | **allowed**, via `.contiguous()` | P4 |
+| broadcast + parity/interleaved nxVL | **allowed** (bcast need not match parity) | R6 |
+| different `K`, **no** broadcast axis | **rejected** (shape error) | verifier |
+| different dtype, no `vcvt` | **rejected** (insert `vcvt`) | verifier |
+| grouped partial (`vbr {group=C}`) as plain operand | **not** R6 — uses Group 7 | grouped bcast |
+
+#### 7.1.4 Hint escape hatch
+
+Defaults are overridable when the author knows the bottleneck (semantically
+inert — correctness is unchanged):
+
+- `prefer_layout {hint = "contiguous" | "interleaved"}` on an operand or the op
+  pins which common layout unification targets (which side moves).
+- `bcast = "vselr" | "ub" | "mask"` selects a grouped-broadcast realization when
+  the operand is a grouped partial (defers to Group 7).
+- `{materialize}` forces an explicit `.contiguous()` instead of lazy unification
+  (e.g. when the unified layout would pessimize a later consumer).
+
+The intent matches the design-exploration RoT: let the default heuristic pick,
+surface a one-line decision note, and only pin with a hint when measured cost
+says the default is wrong (design-exploration §5.5, §6.3).
 
 ---
 
