@@ -112,6 +112,36 @@ This means **the programmer writes 1D**; the API/library inserts `group_view` at
 the exact ops that need VLane structure. It is the smallest change that still lets
 `pto.as` keep a stable 2D layout across a fused per-row chain.
 
+### 1.3.1 Constrain group size to 32B multiples; keep dynamic masking 1D-only
+
+Left unconstrained, `group_view` would admit any `C | L`, and every `C` that is
+not VLane-aligned drags in within-VLane tail masking — which the hardware reduces
+inefficiently anyway. We deliberately **do not** expose that variation:
+
+- **Group size is a 32B multiple.** A group axis must satisfy
+  `C * sizeof(T) % 32 == 0` (equivalently `C` is a multiple of `E_v`), so a group
+  is always a whole number of 32B VLanes and never starts/ends mid-VLane. This is
+  the only granularity at which `vcg*` is clean (`PAT_ALL` per VLane), and it keeps
+  the legal `group_view` set tiny instead of an open space the programmer must
+  reason about. The degenerate `C = E_v` (one VLane) and `C = 8·E_v` (one full reg)
+  are the common cases.
+- **Dynamic / data-dependent masking is a 1D-only feature.** A 1D `vreg<L x T>`
+  carries the tail predicate (`plt/pge`) and data-dependent masks (`vcmp` results,
+  softmax `-inf` pad). A 2D `group_view` assumes the data is **already padded /
+  aligned by the programmer** (rows padded to `E_v` with the reduce identity, row
+  count handled as the 1D reg-tail). So inside a 2D op there is **no per-group
+  dynamic mask** — every group is full.
+- **Caveat — static pad mask is still allowed.** The `C < E_v` pad lanes need a
+  mask, but that is a *compile-time* `PAT_VLn` (identity-pad), not data-dependent.
+  The rule is therefore: **static, descriptor-derived pad masks are fine in 2D;
+  dynamic/data-dependent masks stay 1D.** This is the line we propose; whether even
+  the static pad case should be pushed back to the programmer (so 2D is
+  *fully* mask-free) is **O-2D.5** below.
+
+Rationale: this trades a little generality for a closed, hardware-friendly menu —
+no unaligned group tails, no per-group dynamic predicate fan-out, and a `group_view`
+set small enough that the cost model (Part 5) and the verifier can enumerate it.
+
 ### 1.4 The UB 2D-tile → nxVL mapping (the part that must be correct for fusion)
 
 A 2D tile lives in UB as `[rows][cols]` with some row stride `S` (often padded to
@@ -157,6 +187,57 @@ mapping/axis is committed**, and fusion downstream only reads it. This is the
 concrete reason fusion must run with the descriptor present but the *mode* still
 abstract (Part 3).
 
+### 1.4.1 The mapping is a small *product* space — enumerate it, don't free-form it
+
+M-A and M-B are only two points. A 2D tile in UB actually maps to an nxVL register
+along a **product of independent choices**, and real MoE/quant tiles hit several
+combinations:
+
+| Axis of variation | Options |
+|---|---|
+| col width | `1·VL` / `2·VL` (/ partial padded) |
+| col order | `normal` (contiguous) / `intlv` (DINTLV parity split) |
+| row → level | `vlane` (M-A, row-into-VLane) / `reg` (row → K fan-out) |
+| tile shape | e.g. `2 cols × 2 rows`, `R × 1`, `1 × C`, … |
+
+So "2 cols + 2 rows, cols interleaved" is a perfectly real tile that is *neither*
+M-A nor M-B but a point in this grid. The combinatorics are why a free-form mapping
+is a trap.
+
+**The hard constraint: one pure loop schedule ⇒ one uniform layout.** A single
+straight-line / looped VF schedule can only emit one `(col_order, col_vl,
+row_level)` pattern across the whole tile. Mixed layouts within a tile cannot share
+a loop body, so the mapping must be **declared once and be uniform** — and the
+compiler must *reject*, not silently re-tile, a non-uniform request.
+
+**Proposed syntax sugar — a closed tile-layout descriptor on the load.** Rather than
+let the programmer hand-assemble strides, expose the mapping as a **named choice
+from the enumerable set**, carried on `vlds`:
+
+```mlir
+%t = pto.vmi.vlds %ub[%off]
+     {tile = #pto.vmi.tile<rows = R, cols = C,
+                           col_order = "normal" | "intlv",
+                           col_vl    = 1 | 2,
+                           row_level = "vlane" | "reg">}
+     : !pto.mi.ptr<T, ub> -> !pto.vmi.vreg<R x C x T>
+```
+
+with **named presets** for the common cases so most kernels never spell the fields:
+
+| Preset | Expands to | Use |
+|---|---|---|
+| `BLOCK_ROWS` | `col_order=normal, col_vl=1, row_level=vlane` | M-A (softmax row, MX block) |
+| `DINTLV_COLS` | `col_order=intlv, col_vl=2, row_level=vlane` | M-B (KV pairs, MX window) |
+| `BLOCK_2x2` | `cols=2·VL, rows→vlane, normal` | 2-col × 2-row tiles |
+
+The descriptor is a **closed enum**, not arbitrary strides: the programmer picks
+from a menu, the verifier rejects illegal/mixed combinations, and the uniform-layout
+rule is enforced *by construction*. The same descriptor is what the fused reduce /
+broadcast reads to choose `vcg*` vs fold vs `vselr` (Part 5). This is the "syntax
+sugar to conform" — it makes the legal mappings easy to name and the illegal ones
+impossible to write.
+
 ### 1.5 Open issues (2D)
 
 - **O-2D.1** `C` not dividing `E_v`, or `C > E_v` (row spans VLanes → "1.5D"):
@@ -165,9 +246,15 @@ abstract (Part 3).
   or is it always lowered immediately at the consuming op?
 - **O-2D.3** Cross-VLane (R-axis) reduce: expose as a second `vcg`-style step, or
   always Category C?
-- **O-2D.4** Should `vlds` of a 2D tile take the mapping (`{map = vlane_rows}`) as
-  an explicit token, or infer it from the consuming reduce's `group`? (Explicit is
-  safer for fusion correctness; inferred is terser.)
+- **O-2D.4** Should `vlds` of a 2D tile take the mapping as an explicit token
+  (the §1.4.1 `#pto.vmi.tile` descriptor), or infer it from the consuming reduce's
+  `group`? (Explicit is safer for fusion correctness; inferred is terser. Current
+  lean: explicit, closed-enum descriptor.)
+- **O-2D.5** Should 2D be *fully* mask-free (even the static `C < E_v` pad pushed to
+  the programmer), or do we allow descriptor-derived static pad masks (§1.3.1)?
+- **O-2D.6** How large should the closed `#pto.vmi.tile` enum / preset set be? Just
+  `BLOCK_ROWS` + `DINTLV_COLS` to start, or include `BLOCK_2x2` and 2·VL col forms
+  from day one?
 
 ---
 
@@ -506,7 +593,49 @@ intends — but the ordinary "load-then-widen" and "narrow-then-store" flows nev
 hit it. So the radix-4 predicate gap is a **non-problem** for the common mapping;
 it only constrains the rare register-resident-contiguous case.
 
-### 4.7 Open issues (predicates)
+### 4.7 Intermediate mask storage in UB — raw image vs packed (the fp32 sensitivity)
+
+When the 8-preg budget (Part 2) forces a mask to spill, *how* it is stored in UB
+matters, and the A5 predicate-store modes make the trade explicit. `pto.psts`/`plds`
+offer two packings:
+
+| DIST | UB footprint | Semantics |
+|---|---|---|
+| `NORM` | `VL/8` bytes (= the raw 256-bit predicate image) | store/reload the register image verbatim — **no repack** |
+| `PK`   | `VL/16` bytes | keep one bit of every two (a 2:1 / parity pack) |
+
+The key observation for **fp32 (b32)**: the raw 256-bit image already *is* "4 bits
+per element" (4 bytes/elem × 1 bit/byte). So:
+
+- **`NORM` store of an intermediate mask is a single 9-cycle, byte-aligned,
+  lossless round-trip** — `psts NORM` then `plds NORM` reproduces the exact preg.
+  No `ppack`/`punpack`, no parity reshuffle. Cost: `VL/8 = 32 B` of UB per spilled
+  mask.
+- **Packing an intermediate fp32 mask down to "1 bit per element" (8 B for 64
+  lanes) is the costly path:** it needs a 4:1 reduction (`PK` twice, or `ppack`
+  stages) on store and the symmetric `punpack` on reload — exactly the 1↔4
+  reshuffle §4.6 warns about. For an *intermediate* that will just be re-consumed by
+  the next predicated op, that work is pure overhead.
+
+**Recommendation (default).** For **intermediate** masks, default to **`NORM` (raw
+image, no repack)** — keep the natural 4-bits-per-element fp32 form. It is the
+predicate analog of P7 "decompose until UB": spill cheaply, reload cheaply, never
+repack a value that is about to be re-expanded. Only choose a compact packing
+(`PK`, or full 1-bit-per-element) when:
+
+- the mask is a **persistent / output artifact** (written once, read much later or
+  by another kernel), where UB footprint dominates and the pack cost amortizes; or
+- the kernel is **UB-space-bound** and many masks are live-spilled at once, so the
+  4× footprint of `NORM` actually binds.
+
+This matters most for fp32 precisely because its `NORM` image is 4 bits/elem — the
+pack/unpack ratio (and thus the waste of repacking an intermediate) is highest
+there. For b8 masks the question is moot (`NORM` is already ~1 bit/elem).
+
+This is **O-P.6** below: pick the default and the spill-format cost threshold, and
+decide whether the format is a `pto.as` choice or a `prefer_layout`-style hint.
+
+### 4.8 Open issues (predicates)
 
 - **O-P.1** Is `mask<L x G>` a first-class logical type with its own descriptor, or
   is the predicate always *derived* from the data value it governs at lowering?
@@ -523,6 +652,9 @@ it only constrains the rare register-resident-contiguous case.
   is a joint 32-vreg/8-preg allocator warranted, or a two-phase one?
 - **O-P.5** Half axis (`chistv2`) with *distinct* N0/N1 predicates (vs the current
   shared-predicate assumption) — needed by any caller that filters bins per half.
+- **O-P.6** Intermediate-mask spill format (§4.7): default `NORM` raw image vs
+  packed `PK`/1-bit-per-element. Pick the default and the UB-space threshold at
+  which packing pays; decide if it is a pure `pto.as` choice or a hint.
 
 ---
 
@@ -670,6 +802,12 @@ Carried from the parts above, plus the cross-cutting ones:
 7. **nxVL cost-model sourcing** (O-G.3) — generate the §5.4 vmi cost table from the
    SPEC latency table so it tracks ISA revisions and SOC, and decide how/whether to
    surface per-op cost + a decision log to the programmer (O-G.4).
+8. **2D scope discipline** (O-2D.5/O-2D.6, §1.3.1/§1.4.1) — group size limited to
+   32B multiples, dynamic masking kept 1D-only, and a closed `#pto.vmi.tile` preset
+   enum to enforce one uniform layout per loop. Confirm the preset set and whether
+   2D is fully mask-free.
+9. **Intermediate-mask spill format** (O-P.6, §4.7) — default `NORM` raw image
+   (4 bits/elem for fp32, no repack) vs packed; set the UB-space threshold.
 
 These are intentionally left open; the next discussion pass should pick a position
 on (1) and (4) first, since the load mapping and predicate-type choices gate the
