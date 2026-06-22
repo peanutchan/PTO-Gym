@@ -131,33 +131,49 @@ these shapes:
 
 ## Part 3 — Cost-model conventions & mapping legend
 
-**Cost model (per logical value).** Following design-exploration §5.4:
-
-```
-cost(vmi_op) ≈ fanout × Σ cost(lowered pto.mi ops)
-             + materialization (extra ld/st when a Category-C frontier is crossed)
-             + setup (index / zero / mask register construction)
-fanout = K  (1D, reg-level);  grouped ops add a per-VLane factor handled by vcg*
-```
-
-Each Detail row's **Cost** cell carries three light fields:
+**Cost model (per logical value).** The cost here is **instruction-count based,
+not latency based** — it deliberately omits cycle numbers (the A5 simulator
+latencies in Part 1 are background reference only). Each Detail row's **Cost**
+cell carries two primary fields, plus a VL-utilization note only when it matters:
 
 - **`#mi`** — number of `pto.mi` ops emitted per logical value, as a function of
-  `K` (e.g. `K`, `2K`, `K-1+1`, `1/reg`). This is the "how many instructions
-  mapped to pto.mi" you asked for.
-- **VL-util** — fraction of the 256B vreg width doing useful work after layout.
-  `100%` = contiguous full reg; `C/E_v` = a `C`-wide row padded to a VLane;
-  `1/E_v` = a single reduced partial sitting alone in a VLane.
-- **note** — dominant cycle term and/or budget pressure (extra vreg/preg live,
-  or a Category-C materialization).
+  `K` (e.g. `K`, `2K`, `K-1+1`, `1/reg`). This is "how many instructions are
+  generated per `K`".
+- **`dep`** — the **longest dependency path** (critical-path depth) through the
+  emitted `pto.mi` ops, in number of *dependent* ops. Independent fan-out across
+  the `K` regs does **not** add depth (so `K` parallel ops → `dep=1`); a serial
+  fold or a store→reload chain does (so a `K`-deep fold → `dep=K`). This is the
+  latency-shape proxy without committing to cycles.
+- **`util`** *(note, only shown when **< 100%**)* — the fraction of the 256B vreg
+  width doing useful work after layout. If a row omits `util`, treat it as
+  **100%** (contiguous, full reg). When shown: `C/E_v` = a `C`-wide row padded to
+  a VLane; `R/E_v` = one partial per VLane after a group reduce; `1/L` = a single
+  reduced scalar; `replicate` = a broadcast 1-reg value read `K` times.
+
+**Layout in→out convention.** Each Detail table has a **Layout in→out** column
+stating, for the op's operand(s) and result, whether the layout is **passed
+through** or **must be inferred/assigned** by `pto.as`:
+
+| Marker | Meaning |
+|---|---|
+| `pass` | Pass-through: result layout = operand layout, only propagated. No new axis added or consumed; no inference decision beyond propagation (R1 elementwise). |
+| `infer(x)` | The layout is **assigned/inferred** here — the op introduces axis `x` on its result (Category-B producer) or normalizes to a new shape. `x` ∈ {`parity`,`width`,`half`,`bcast`,`reduce`,`tile`,`partials`,`dist`}. |
+| `consume(x)` | The op **requires** its input already carry axis `x`; if not, `pto.as` runs unification (C6) or inserts `.contiguous()` (P4). |
+| `UB` | The memory side of a load/store (not a register layout). |
+| `unify` | Two full-cardinality operands in different layouts → lazy unification (C6/P7) picks a common layout (see §7.1). |
+
+The cell is written `<in> → <out>` (e.g. `pass → pass`, `UB → infer(tile)`,
+`consume(parity) → UB`, `pass → infer(reduce)`). "`pass → pass`" is the common,
+inference-free case; anything with `infer`/`consume`/`unify` is where `pto.as`
+makes a layout decision.
 
 **Mapping shorthand legend** (used in the `pto.vmi -> pto.mi` column):
 
 | Shorthand | Meaning |
 |---|---|
-| `K × op` | `op` emitted once per physical reg (R1 fan-out) |
+| `K × op` | `op` emitted once per physical reg (R1 fan-out), independent → `dep=1` |
 | `1/reg op` | one `op` per reg, but it is the whole lowering (e.g. `vcgadd`) |
-| `(K-1)× vadd + vcadd` | fold chain then one reduce (R4b fold-then-reduce) |
+| `(K-1)× vadd + vcadd` | fold chain then one reduce (R4b fold-then-reduce), serial → `dep≈K` |
 | `+ ppack` / `+ pdintlv` | predicate companion op also emitted (Part 4 design) |
 | `EVEN/ODD`, `P0..P3` | parity (radix-2) / radix-4 part modes on `vcvt` |
 | `[C]` | Category-C frontier → `.contiguous()` (store+reload) may be inserted |
@@ -277,16 +293,16 @@ lowering-only (requirements §4.2). On a 2D load, the `#pto.vmi.tile` descriptor
 (Part 2) commits the `(row,col)->(reg,VLane,lane)` mapping so downstream fused
 reduce/broadcast can read it.
 
-| `pto.vmi` op | Functional description | Datatypes | Layout | Mask in | `pto.vmi -> pto.mi` mapping | Cost (`#mi` / VL-util / note) |
+| `pto.vmi` op | Functional description | Datatypes | Layout in→out | Mask in | `pto.vmi -> pto.mi` mapping | Cost (`#mi` / `dep` / util) |
 |---|---|---|---|---|---|---|
-| `vlds` (1D contig) | UB→vreg contiguous load | i8–i64, f16/bf16, f32 | 1D pass-through | `no` | `K × vlds NORM` | `#mi=K` / 100% / 9c each; dual-issue |
-| `vlds` (2D tile) | UB→vreg load with tile mapping | i8–i32, f16/bf16, f32 | 2D-native (`#pto.vmi.tile`) | `no` | `K × vlds` with `NORM` (`BLOCK_ROWS`) or `DINTLV_B*` (`DINTLV_COLS`); pad tail lanes with reduce identity | `#mi=K` / `C/E_v` (row<VLane) / 9c; DINTLV K=2 |
-| `vlds` (broadcast) | scalar/block replicate load | i8–i32, f16/bf16, f32 | produces `broadcast` (R6) | `no` | `1 × vlds BRC_B*` / `BRC_BLK` | `#mi=1` / replicate-read / 9c; no fan-out |
-| `vlds` (tail/partial) | logically-predicated load (tail) | as above | 1D + tail predicate | `no` (load) | `K × vlds` (unpredicated); the logical mask migrates to the **consumer** / **store**, or shortens load length (Part 3) | `#mi=K` / `len/L` / 9c; predicate not on the load |
-| `vsts` (1D contig) | vreg→UB contiguous store | i8–i64, f16/bf16, f32 | 1D pass-through | `Pg` | `K × vsts NORM_B*` | `#mi=K` / 100% / 9c; pairs 1+1 with `vlds` |
-| `vsts` (interleave) | store consuming a parity/half axis | i8–i32, f16/bf16, f32 | consumes `parity`/`half`/`width` (R3) | `Pg` | `K × vstsx2 INTLV_B*` (+ `pintlv` companion) | `#mi=K` / 100% / **12c** (INTLV); `r=4`→2 stages |
-| `vsts` (packed quant) | narrow-on-store distribution | fp8, int8, int4 | consumes `width` (R3) | `Pg` | `vsts PK4_B32` (int4: `i*VL/2` addr + packed mask) | `#mi=K` / 100% / 9c; no register pack |
-| `vldas`/`vstas`/`vstar` | alignment-state load/store helpers | i8–i32, f16/bf16, f32 | 1D (align carrier) | `no` | alignment-state pipe ops | `#mi=K` / — / 9c; unpredicated |
+| `vlds` (1D contig) | UB→vreg contiguous load | i8–i64, f16/bf16, f32 | `UB → infer(dist)` | `no` | `K × vlds NORM` | `#mi=K` / `dep=1` (independent) |
+| `vlds` (2D tile) | UB→vreg load with tile mapping | i8–i32, f16/bf16, f32 | `UB → infer(tile)` | `no` | `K × vlds` with `NORM` (`BLOCK_ROWS`) or `DINTLV_B*` (`DINTLV_COLS`); pad tail lanes with reduce identity | `#mi=K` / `dep=1` / util `C/E_v` (row<VLane) |
+| `vlds` (broadcast) | scalar/block replicate load | i8–i32, f16/bf16, f32 | `UB → infer(bcast)` | `no` | `1 × vlds BRC_B*` / `BRC_BLK` | `#mi=1` / `dep=1` / util replicate |
+| `vlds` (tail/partial) | logically-predicated load (tail) | as above | `UB → infer(dist)` | `no` (load) | `K × vlds` (unpredicated); the logical mask migrates to the **consumer** / **store**, or shortens load length (Part 3) | `#mi=K` / `dep=1` / util `len/L` |
+| `vsts` (1D contig) | vreg→UB contiguous store | i8–i64, f16/bf16, f32 | `pass → UB` | `Pg` | `K × vsts NORM_B*` | `#mi=K` / `dep=1` |
+| `vsts` (interleave) | store consuming a parity/half axis | i8–i32, f16/bf16, f32 | `consume(parity/half/width) → UB` | `Pg` | `K × vstsx2 INTLV_B*` (+ `pintlv` companion) | `#mi=K` / `dep=1` per reg; `r=4`→2 stages |
+| `vsts` (packed quant) | narrow-on-store distribution | fp8, int8, int4 | `consume(width) → UB` | `Pg` | `vsts PK4_B32` (int4: `i*VL/2` addr + packed mask) | `#mi=K` / `dep=1`; no register pack |
+| `vldas`/`vstas`/`vstar` | alignment-state load/store helpers | i8–i32, f16/bf16, f32 | `UB ↔ infer(align)` | `no` | alignment-state pipe ops | `#mi=K` / `dep=1`; unpredicated |
 
 **Notes.** `vlds`/`vsts` of a contiguous `K=1` value is the P6 1:1 case — exactly
 one `pto.mi` op, zero overhead. The interleave/deinterleave is never user-spelled;
@@ -305,10 +321,10 @@ Replication and index materialization. These produce a `broadcast` axis (1-reg
 backing, replicate-read under R6) or an index vector, and never expand into `K`
 stored copies until a Category-B/C edge needs the expanded form.
 
-| `pto.vmi` op | Functional description | Datatypes | Layout | Mask in | `pto.vmi -> pto.mi` mapping | Cost (`#mi` / VL-util / note) |
+| `pto.vmi` op | Functional description | Datatypes | Layout in→out | Mask in | `pto.vmi -> pto.mi` mapping | Cost (`#mi` / `dep` / util) |
 |---|---|---|---|---|---|---|
-| `vdup` | replicate a lane/value across lanes (or rows in 2D) | i8–i32, f16/bf16, f32 | produces `broadcast`; 2D-aware (row replicate) | `Pg` | `1 × vdup` (reg); 2D row-replicate = replicate-read across VLanes | `#mi=1` (+K replicate-reads) / 100% / cheap, no ld/st |
-| `arange` / `vci` | generate `[base, base±i]` lane indices | i8–i32, f16, f32 | produces index value (Category A) | `no` | `1 × vci {ASC/DESC}` per chunk | `#mi=1`/chunk / 100% / cheap; reused via R6 |
+| `vdup` | replicate a lane/value across lanes (or rows in 2D) | i8–i32, f16/bf16, f32 | `pass → infer(bcast)` | `Pg` | `1 × vdup` (reg); 2D row-replicate = replicate-read across VLanes | `#mi=1` (+K replicate-reads) / `dep=1` / util replicate |
+| `arange` / `vci` | generate `[base, base±i]` lane indices | i8–i32, f16, f32 | `(none) → infer(idx)` | `no` | `1 × vci {ASC/DESC}` per chunk | `#mi=1`/chunk / `dep=1` |
 
 **Notes.** `vdup` is the cheap ungrouped broadcast (lane→all, register-resident,
 no UB roundtrip) — prefer it over a UB `BRC` reload when broadcasting a single
@@ -326,23 +342,24 @@ the P3 core profile these fan out as fully-unrolled straight-line code. Mixed
 operand cardinality (inferred broadcast) and mixed operand layout (auto-unify)
 are resolved automatically — see §7.1.
 
-| `pto.vmi` op(s) | Functional description | Datatypes | Layout | Mask in | `pto.vmi -> pto.mi` mapping | Cost (`#mi` / VL-util / note) |
+| `pto.vmi` op(s) | Functional description | Datatypes | Layout in→out | Mask in | `pto.vmi -> pto.mi` mapping | Cost (`#mi` / `dep` / util) |
 |---|---|---|---|---|---|---|
-| `vadd vsub vmul vdiv vmax vmin` | binary arithmetic | i8–i32, f16/bf16, f32 (`vdiv` f16/f32) | 1D pass-through | `Pg` | `K × <op>` | `#mi=K` / 100% / ~7c each |
-| `vand vor vxor vnot` | bitwise | i8–i32 (bit-typed) | 1D pass-through | `Pg` | `K × <op>` | `#mi=K` / 100% / ~7c |
-| `vshl vshr` | element shift (vector count) | i8–i32 | 1D pass-through | `Pg` | `K × <op>` | `#mi=K` / 100% / ~7c |
-| `vadds vmuls vmaxs vmins vshls vshrs` | vec-scalar (scalar implicit broadcast) | i8–i32, f16/bf16, f32 | 1D pass-through; scalar = R6/M2 | `Pg` | `K × <op>s` | `#mi=K` / 100% / ~7c; no extra reg for scalar |
-| `vabs vneg vrelu` | unary arithmetic / activation | i8–i32, f16/bf16, f32 | 1D pass-through | `Pg` | `K × <op>` | `#mi=K` / 100% / ~7c |
-| `vexp vln vsqrt` | unary transcendental | f16, f32 | 1D pass-through | `Pg` | `K × <op>` | `#mi=K` / 100% / transcendental-class |
-| `vcmp vcmps` | compare → predicate mask | i8–i32, f16/bf16, f32 | 1D; produces a `mask` (Group 10) | `Pg req` (`%seed`) | `K × vcmp(s)` → `mask` | `#mi=K` / 100% / ~7c; +1 preg per live mask |
-| `vsel` | predicate select between two vecs | i8–i32, f16/bf16, f32 | 1D pass-through | `Pg req` (selector) | `K × vsel` | `#mi=K` / 100% / ~7c |
-| `vselr` | register gather/permute select | i8–i32, f16/bf16, f32 | 1D; permute (used by grouped bcast) | `no` (uses `%idx`) | `K × vselr` (+ index reg setup) | `#mi=K` / 100% / **~4×** lower thruput; +1 index vreg |
+| `vadd vsub vmul vdiv vmax vmin` | binary arithmetic | i8–i32, f16/bf16, f32 (`vdiv` f16/f32) | `pass → pass` (or `unify`) | `Pg` | `K × <op>` | `#mi=K` / `dep=1` |
+| `vand vor vxor vnot` | bitwise | i8–i32 (bit-typed) | `pass → pass` | `Pg` | `K × <op>` | `#mi=K` / `dep=1` |
+| `vshl vshr` | element shift (vector count) | i8–i32 | `pass → pass` | `Pg` | `K × <op>` | `#mi=K` / `dep=1` |
+| `vadds vmuls vmaxs vmins vshls vshrs` | vec-scalar (scalar implicit broadcast) | i8–i32, f16/bf16, f32 | `pass → pass` (scalar = bcast) | `Pg` | `K × <op>s` | `#mi=K` / `dep=1`; no extra reg for scalar |
+| `vabs vneg vrelu` | unary arithmetic / activation | i8–i32, f16/bf16, f32 | `pass → pass` | `Pg` | `K × <op>` | `#mi=K` / `dep=1` |
+| `vexp vln vsqrt` | unary transcendental | f16, f32 | `pass → pass` | `Pg` | `K × <op>` | `#mi=K` / `dep=1` |
+| `vcmp vcmps` | compare → predicate mask | i8–i32, f16/bf16, f32 | `pass → infer(mask)` | `Pg req` (`%seed`) | `K × vcmp(s)` → `mask` | `#mi=K` / `dep=1`; +1 preg per live mask |
+| `vsel` | predicate select between two vecs | i8–i32, f16/bf16, f32 | `pass → pass` | `Pg req` (selector) | `K × vsel` | `#mi=K` / `dep=1` |
+| `vselr` | register gather/permute select | i8–i32, f16/bf16, f32 | `pass → pass` (permute) | `no` (uses `%idx`) | `K × vselr` (+ index reg setup) | `#mi=K` / `dep=1` (+1 for index setup); +1 index vreg |
 
-**Notes.** Everything here is `K`-fan-out with VL-util `100%` and no
-materialization — the register-fuse sweet spot (design-exploration §6.1: fuse
-elementwise chains per-reg). `vselr` is the exception: it is the permute/gather
-class and is the register-resident realization of a grouped broadcast (Group 7),
-so its cost is called out even though it is surface-eltwise.
+**Notes.** Everything here is `K`-fan-out, `dep=1` (the `K` ops are independent),
+full-width util, and no materialization — the register-fuse sweet spot
+(design-exploration §6.1: fuse elementwise chains per-reg). `vselr` is the
+exception: it is the permute/gather class and is the register-resident
+realization of a grouped broadcast (Group 7), so its cost is called out even
+though it is surface-eltwise.
 
 ### 7.1 Operand compatibility, inferred broadcast, and layout defaults
 
@@ -446,10 +463,10 @@ says the default is wrong (design-exploration §5.5, §6.3).
 cheap; the **grouped** form (per-VLane partial fanned back over its own lanes) is
 the asymmetric hard case and is fully treated in Group 7.
 
-| `pto.vmi` op | Functional description | Datatypes | Layout | Mask in | `pto.vmi -> pto.mi` mapping | Cost (`#mi` / VL-util / note) |
+| `pto.vmi` op | Functional description | Datatypes | Layout in→out | Mask in | `pto.vmi -> pto.mi` mapping | Cost (`#mi` / `dep` / util) |
 |---|---|---|---|---|---|---|
-| `vbr` (ungrouped) | broadcast a length-1 / lane-0 value over `L` | i8–i32, f16/bf16, f32 | produces `broadcast`; 1-reg backing | `no` | `1 × vdup` (reg) **or** `vsts`+`vlds BRC_*` (UB) | `#mi=1` (`vdup`) / replicate-read / cheap, no ld/st if `vdup` |
-| `vbr` (grouped, `{group=C}`) | broadcast each VLane partial across its `C` lanes | i8–i32, f16/bf16, f32 | **2D-native**; consumes per-VLane partial | `no`* | UB-roundtrip `BRC_BLK` / `vselr` / masked-recompute → see Group 7 | varies / `C/E_v` / **decision point** |
+| `vbr` (ungrouped) | broadcast a length-1 / lane-0 value over `L` | i8–i32, f16/bf16, f32 | `pass → infer(bcast)` (1-reg backing) | `no` | `1 × vdup` (reg) **or** `vsts`+`vlds BRC_*` (UB) | `#mi=1` (`vdup`) / `dep=1` / util replicate |
+| `vbr` (grouped, `{group=C}`) | broadcast each VLane partial across its `C` lanes | i8–i32, f16/bf16, f32 | `consume(partials) → infer(2D)` | `no`* | UB-roundtrip `BRC_BLK` / `vselr` / masked-recompute → see Group 7 | varies / `dep` 2–3 / util `C/E_v` — **decision point** |
 
 **Notes.** Fused reduce→broadcast (`vcadd`+`vdup`) is the recognized R4/M2
 fusion: `pto.as` emits them back-to-back and keeps the result as a `broadcast`
@@ -467,13 +484,13 @@ A reduction over the whole 1D value, or over a 2D row (`{group}` → Group 6/7).
 R4 gives three realizations keyed off how the reduce axis sits in the hierarchy;
 `pto.as` picks by `K`, ILP, and whether an arg-index is needed (M1).
 
-| `pto.vmi` op | Functional description | Datatypes | Layout | Mask in | `pto.vmi -> pto.mi` mapping | Cost (`#mi` / VL-util / note) |
+| `pto.vmi` op | Functional description | Datatypes | Layout in→out | Mask in | `pto.vmi -> pto.mi` mapping | Cost (`#mi` / `dep` / util) |
 |---|---|---|---|---|---|---|
-| `vreduce_add` | sum-reduce to a scalar / partial | i8–i32 (widening), f16, f32 | 1D consume `reduce`; 2D-aware | `Pg` | R4b fold: `(K-1)× vadd + 1× vcadd`; or R4b partial: `K× vcadd + combine` | `#mi≈K` / `1/L` result / fold = serial dep; partial = better ILP |
-| `vreduce_max` / `vreduce_min` | max/min reduce | i16–i32, f16, f32 | 1D consume `reduce`; 2D-aware | `Pg` | `(K-1)× vmax + 1× vcmax` (value); arg form adds R4c index offset `+k·lanes` | `#mi≈K` / `1/L` (`2/L` w/ index) / arg needs index combine |
-| `vreduce_*` (R4a, `{group=E_v}`) | VLane-aligned group reduce | as above | **2D-native** | `Pg` | `1/reg vcgadd/vcgmax/vcgmin` | `#mi=K` / `R/E_v` result / **cheapest**; no combine |
-| `vreduce_*` (R4d, unaligned) | sub-VLane / unaligned reduce | as above | 1D, Category C | `Pg` | `[C]` materialize then reduce / rotate-shuffle | `#mi=K+ld/st` / low / **last resort** |
-| `vcpadd` | inclusive prefix sum (scan) | f16, f32 | 1D pass-through (per-reg) | `Pg` | `K × vcpadd` (+ carry combine across regs) | `#mi≈K` / 100% / cross-reg carry serial |
+| `vreduce_add` | sum-reduce to a scalar / partial | i8–i32 (widening), f16, f32 | `consume(reduce) → infer(reduce)` | `Pg` | R4b fold: `(K-1)× vadd + 1× vcadd`; or R4b partial: `K× vcadd + combine` | `#mi≈K` / `dep`: fold `=K`, partial `=1+⌈log₂K⌉` / util `1/L` result |
+| `vreduce_max` / `vreduce_min` | max/min reduce | i16–i32, f16, f32 | `consume(reduce) → infer(reduce)` | `Pg` | `(K-1)× vmax + 1× vcmax` (value); arg form adds R4c index offset `+k·lanes` | `#mi≈K` / `dep`: fold `=K` / util `1/L` (`2/L` w/ index) |
+| `vreduce_*` (R4a, `{group=E_v}`) | VLane-aligned group reduce | `consume(2D) → infer(partials)` | `Pg` | `1/reg vcgadd/vcgmax/vcgmin` | `#mi=K` / `dep=1` / util `R/E_v` — **cheapest**, no combine |
+| `vreduce_*` (R4d, unaligned) | sub-VLane / unaligned reduce | `consume([C]) → infer(reduce)` | `Pg` | `[C]` materialize then reduce / rotate-shuffle | `#mi=K+ld/st` / `dep` 2–3 (st→ld→reduce) / **last resort** |
+| `vcpadd` | inclusive prefix sum (scan) | f16, f32 | `pass → pass` (per-reg) | `Pg` | `K × vcpadd` (+ carry combine across regs) | `#mi≈K` / `dep=K` (cross-reg carry serial) |
 
 **Notes.** R4a (VLane-aligned, the `{group=E_v}` case) is the bridge to Group 6:
 when the reduce axis is exactly the 32B VLane it is one `vcg*` per reg, no
@@ -490,11 +507,11 @@ The native per-32B-VLane reduce (R4a). This is the 2D-native primitive: each row
 of the 2D view occupies one VLane, and one instruction collapses all 8 VLanes of
 a reg at once — the high-VL-utilization win over padding each row to a full reg.
 
-| `pto.vmi` op | Functional description | Datatypes | Layout | Mask in | `pto.vmi -> pto.mi` mapping | Cost (`#mi` / VL-util / note) |
+| `pto.vmi` op | Functional description | Datatypes | Layout in→out | Mask in | `pto.vmi -> pto.mi` mapping | Cost (`#mi` / `dep` / util) |
 |---|---|---|---|---|---|---|
-| `vcgadd` | sum within each VLane | i16–i32, f16, f32 | **2D-native** (`col`=lane, `row`=vlane) | `Pg` | `1/reg vcgadd` | `#mi=K` / inputs 100%, output `R/E_v` / one op/reg, no ld/st |
-| `vcgmax` | max within each VLane | i16–i32, f16, f32 | **2D-native** | `Pg` | `1/reg vcgmax` | `#mi=K` / same / no materialize |
-| `vcgmin` | min within each VLane | i16–i32, f16, f32 | **2D-native** | `Pg` | `1/reg vcgmin` | `#mi=K` / same / no materialize |
+| `vcgadd` | sum within each VLane | i16–i32, f16, f32 | `consume(2D) → infer(partials)` (`col`=lane, `row`=vlane) | `Pg` | `1/reg vcgadd` | `#mi=K` / `dep=1` / util `R/E_v` output (input 100%) |
+| `vcgmax` | max within each VLane | i16–i32, f16, f32 | `consume(2D) → infer(partials)` | `Pg` | `1/reg vcgmax` | `#mi=K` / `dep=1` / util `R/E_v` output |
+| `vcgmin` | min within each VLane | i16–i32, f16, f32 | `consume(2D) → infer(partials)` | `Pg` | `1/reg vcgmin` | `#mi=K` / `dep=1` / util `R/E_v` output |
 
 **Notes.** Output is one partial per VLane (at lanes `0,8,16,…` for f32),
 i.e. `R = 8K` partials. `C < E_v` rows must be padded with the reduce identity
@@ -511,21 +528,21 @@ per reg). Grouped **broadcast** — fanning each VLane's own partial back across
 its `C` lanes — has **no native single instruction** (design-exploration §5.1).
 The realization is a cost-model decision, not a fixed rule.
 
-| Pattern | Functional description | Datatypes | Layout | Mask in | `pto.vmi -> pto.mi` mapping | Cost (`#mi` / VL-util / note) |
+| Pattern | Functional description | Datatypes | Layout in→out | Mask in | `pto.vmi -> pto.mi` mapping | Cost (`#mi` / `dep` / util) |
 |---|---|---|---|---|---|---|
-| grouped reduce (`vreduce_* {group=C}`) | per-VLane block reduce | i16–i32, f16, f32 | 2D-native | `Pg` | `1/reg vcg*` | `#mi=K` / `R/E_v` out / cheap |
-| grouped bcast — **UB roundtrip** | store partials, reload block-broadcast | i8–i32, f16/bf16, f32 | 2D-native | `Pg` (store) | `vsts` partials + `vlds BRC_BLK` | `#mi=2K` / `C/E_v` / **+2 ld/st** (9c each, pair 1+1) + UB scratch |
-| grouped bcast — **`vselr` gather** | index reg + register permute | i8–i32, f16/bf16, f32 | 2D-native, register-resident | `no` | `vci`+`vmuls` (index) + `K× vselr` | `#mi=K+setup` / `C/E_v` / **~4×** lower thruput; +1 index vreg; no ld/st |
-| grouped bcast — **masked recompute** | per-group arithmetic under masks | i8–i32, f16/bf16, f32 | 2D-native, register-resident | `Pg req` | per-group full op under `PAT_VLn` masks | `#mi∝#groups` / `C/E_v` / +mask pregs; scales with group count |
-| fused `reduce+bcast+eltwise` | per-row normalize (softmax/MX) | f16/bf16, f32 | 2D-native | `Pg` | `vcg*` + (one bcast realization) + `K× eltwise` | see chosen bcast row + `K×7c` eltwise |
+| grouped reduce (`vreduce_* {group=C}`) | per-VLane block reduce | i16–i32, f16, f32 | `consume(2D) → infer(partials)` | `Pg` | `1/reg vcg*` | `#mi=K` / `dep=1` / util `R/E_v` out |
+| grouped bcast — **UB roundtrip** | store partials, reload block-broadcast | i8–i32, f16/bf16, f32 | `consume(partials) → infer(2D)` | `Pg` (store) | `vsts` partials + `vlds BRC_BLK` | `#mi=2K` / `dep=2` (st→ld) / util `C/E_v` + UB scratch |
+| grouped bcast — **`vselr` gather** | index reg + register permute | i8–i32, f16/bf16, f32 | `consume(partials) → infer(2D)` | `no` | `vci`+`vmuls` (index) + `K× vselr` | `#mi=K+setup` / `dep=3` (vci→vmuls→vselr) / util `C/E_v`; +1 index vreg |
+| grouped bcast — **masked recompute** | per-group arithmetic under masks | i8–i32, f16/bf16, f32 | `consume(partials) → infer(2D)` | `Pg req` | per-group full op under `PAT_VLn` masks | `#mi∝#groups` / `dep∝#groups` / util `C/E_v`; +mask pregs |
+| fused `reduce+bcast+eltwise` | per-row normalize (softmax/MX) | f16/bf16, f32 | `consume(2D) → pass` | `Pg` | `vcg*` + (one bcast realization) + `K× eltwise` | `#mi`= reduce+bcast+`K` / `dep`= bcast `dep`+1 / util `C/E_v` |
 
 **Decision guide (RoT-1, design-exploration §6.2).** Default to the **UB
-roundtrip** for grouped `reduce+bcast+eltwise`: the `vsts`+`vlds BRC_BLK` are two
-9-cycle ops that pair on the `vlds`+`vsts` (1+1) issue slot and free registers
-for the eltwise. Use **`vselr`** only when group count and `K` are both tiny
-*and* the loop is vector-issue-bound (not UB-bandwidth-bound). Use **masked
-recompute** only for very small group counts. `pto.as` should emit a one-line
-decision-log note of which realization it picked and why, and honor a
+roundtrip** for grouped `reduce+bcast+eltwise`: the `vsts`+`vlds BRC_BLK` pair on
+the `vlds`+`vsts` (1+1) issue slot and free registers for the eltwise. Use
+**`vselr`** only when group count and `K` are both tiny *and* the loop is
+vector-issue-bound (not UB-bandwidth-bound). Use **masked recompute** only for
+very small group counts. `pto.as` should emit a one-line decision-log note of
+which realization it picked and why, and honor a
 `prefer_layout {bcast = "ub"|"vselr"|"mask"}` override (semantically inert).
 
 **Why no cheap native form.** Reduce collapses lanes into one slot (`vcg*` does
@@ -543,12 +560,12 @@ the dtype-specific cast chain + part/width staging + matching store
 distribution, and drags the predicate companion (Group 10). The author never
 spells `EVEN/ODD`, `P0..P3`, `Pack`, `int4x2_t`, or `VL/2` addresses.
 
-| `pto.vmi` op (form) | Functional description | Datatypes | Layout | Mask in | `pto.vmi -> pto.mi` mapping | Cost (`#mi` / VL-util / note) |
+| `pto.vmi` op (form) | Functional description | Datatypes | Layout in→out | Mask in | `pto.vmi -> pto.mi` mapping | Cost (`#mi` / `dep` / util) |
 |---|---|---|---|---|---|---|
-| `vcvt` 16↔32 (radix-2) | widen/narrow f16/i16 ↔ f32/i32 | f16/bf16↔f32, i16↔i32 | produces/consumes `parity(r=2)` | `Pg` | `2K × vcvt EVEN/ODD` + `ppack`/`punpack` companion | `#mi=2K` / 100% / one radix-2 step; K grows 1→2 on widen |
-| `vcvt` 8↔32 (radix-4) | widen/narrow i8/u8 ↔ i32/f32 | i8/u8↔i32/f32 | produces/consumes `width(r=4)` | `Pg` | widen: `UNPK_B8`+`vintlv`+`vcvt P0` + one `punpack`; narrow: `PK4_B32` store (or `vselr` gather) + one `ppack` | `#mi≈2–3` / 100% / no UB roundtrip in fast path; +zero/index setup reg |
-| `vcvt` quant f32→{fp8,int8,int4} | quantized narrow with packed store | f32 → fp8_e4m3, int8, int4 | consumes `width`; store-dist derived | `Pg` | fp8: `1 cast`+`PK4_B32`; int8: 3-stage cast+`PK4_B32`; int4: cast+`Pack`+`int4x2_t`+`PK4_B32` (`i*VL/2`, packed mask) | `#mi=K..3K` / 100% / chain depth by dtype; int4 half-addr derived |
-| `vtrc` | truncate/round-convert (mode token) | f16/bf16, f32 → int | 1D pass-through (per-reg) | `Pg` | `K × vtrc` | `#mi=K` / 100% / ~7c |
+| `vcvt` 16↔32 (radix-2) | widen/narrow f16/i16 ↔ f32/i32 | f16/bf16↔f32, i16↔i32 | `pass → infer(parity r=2)` | `Pg` | `2K × vcvt EVEN/ODD` + `ppack`/`punpack` companion | `#mi=2K` / `dep=2` (cvt→pack) / K grows 1→2 on widen |
+| `vcvt` 8↔32 (radix-4) | widen/narrow i8/u8 ↔ i32/f32 | i8/u8↔i32/f32 | `pass → infer(width r=4)` | `Pg` | widen: `UNPK_B8`+`vintlv`+`vcvt P0` + one `punpack`; narrow: `PK4_B32` store (or `vselr` gather) + one `ppack` | `#mi≈2–3` / `dep` 2–3 / +zero/index setup reg |
+| `vcvt` quant f32→{fp8,int8,int4} | quantized narrow with packed store | f32 → fp8_e4m3, int8, int4 | `consume(width) → infer(dist)` | `Pg` | fp8: `1 cast`+`PK4_B32`; int8: 3-stage cast+`PK4_B32`; int4: cast+`Pack`+`int4x2_t`+`PK4_B32` (`i*VL/2`, packed mask) | `#mi=K..3K` / `dep` = chain depth (1/3/4 by dtype) |
+| `vtrc` | truncate/round-convert (mode token) | f16/bf16, f32 → int | `pass → pass` (per-reg) | `Pg` | `K × vtrc` | `#mi=K` / `dep=1` |
 
 **Notes.** Radix-4 (b8↔b32) is **not** a stacked predicate chain and **not** a
 UB roundtrip: the 1↔4 lane spread rides the data load/store distribution
@@ -565,18 +582,18 @@ Special-function / domain-accelerator ops. Mixed categories: `chistv2` produces
 a `half` axis (Category B); sort and gather/scatter are Category-C tile/permute
 ops; the fused activation/arith ops are Category-A `vreg→vreg`.
 
-| `pto.vmi` op | Functional description | Datatypes | Layout | Mask in | `pto.vmi -> pto.mi` mapping | Cost (`#mi` / VL-util / note) |
+| `pto.vmi` op | Functional description | Datatypes | Layout in→out | Mask in | `pto.vmi -> pto.mi` mapping | Cost (`#mi` / `dep` / util) |
 |---|---|---|---|---|---|---|
-| `chistv2` | histogram / per-bin count | i8–i32 (bin index) | **produces `half` axis** (`Bin_N0/N1`) | `Pg` (per-half) | `chistv2 Bin_N0` + `Bin_N1` (two-half fanout) + widen/accumulate | `#mi≈2K` / `half` / per-half predicate; INTLV store to merge bins |
-| `vbitsort` | sort 32 (score,index) proposals | f16/f32 score + i32 idx | Category C (UB helper) | `no` | `vbitsort` (UB→UB, `VBS32`) | UB op / n/a / no decomposition; 8B records |
-| `vmrgsort4` | merge 4 pre-sorted lists | i16–i32, f16, f32 | Category C (UB helper) | `no` | `vmrgsort4` (+ `get_vms4_sr`) | UB op / n/a / inputs must be pre-sorted |
-| `vgather2` / `vgatherb` | indexed gather (B32 / byte) | i8–i32, f16/bf16, f32 | Category C; needs contiguous index table | `Pg` | `vgather2` / `vgatherb` | `#mi=K` / data-dep / **27–28 / ~21c**, ~0.1 op/cyc |
-| `vscatter` | indexed scatter | i8–i32, f16/bf16, f32 | Category C | `Pg` | `vscatter` | `#mi=K` / data-dep / **~17c** |
-| `vexpdif` | fused `exp(x − max)` (softmax) | in f16/f32 → out f32 | 1D pass-through (EVEN/ODD contract) | `Pg` | `K × vexpdif` | `#mi=K` / 100% / fuses sub+exp |
-| `vaxpy` | fused `α·x + y` | f16, f32 | 1D pass-through | `Pg` | `K × vaxpy` | `#mi=K` / 100% / ~arith |
-| `vlrelu` / `vprelu` | leaky / parametric ReLU | f16, f32 | 1D pass-through | `Pg` | `K × vlrelu`/`vprelu` | `#mi=K` / 100% / ~arith |
-| `vmull` | widening 32×32→64 multiply (hi/lo) | i32/u32 | 1D; produces hi+lo pair | `Pg` | `K × vmull` | `#mi=K` / 100% / two result regs |
-| `vmula` | fused multiply-accumulate | i8–i32, f16/bf16, f32 | 1D pass-through | `Pg` | `K × vmula` | `#mi=K` / 100% / not always = vmul+vadd |
+| `chistv2` | histogram / per-bin count | i8–i32 (bin index) | `pass → infer(half)` (`Bin_N0/N1`) | `Pg` (per-half) | `chistv2 Bin_N0` + `Bin_N1` (two-half fanout) + widen/accumulate | `#mi≈2K` / `dep` 2–3 (chist→accum) / util `half`; INTLV store to merge |
+| `vbitsort` | sort 32 (score,index) proposals | f16/f32 score + i32 idx | `UB → UB` (Category C) | `no` | `vbitsort` (UB→UB, `VBS32`) | `#mi`=1 UB op / `dep=1` / no decomposition; 8B records |
+| `vmrgsort4` | merge 4 pre-sorted lists | i16–i32, f16, f32 | `UB → UB` (Category C) | `no` | `vmrgsort4` (+ `get_vms4_sr`) | `#mi`=1 UB op / `dep=1` / inputs must be pre-sorted |
+| `vgather2` / `vgatherb` | indexed gather (B32 / byte) | i8–i32, f16/bf16, f32 | `consume(idx) → infer(dist)` (Category C) | `Pg` | `vgather2` / `vgatherb` | `#mi=K` / `dep=1` / util data-dep |
+| `vscatter` | indexed scatter | i8–i32, f16/bf16, f32 | `consume(idx) → UB` (Category C) | `Pg` | `vscatter` | `#mi=K` / `dep=1` / util data-dep |
+| `vexpdif` | fused `exp(x − max)` (softmax) | in f16/f32 → out f32 | `pass → pass` (EVEN/ODD contract) | `Pg` | `K × vexpdif` | `#mi=K` / `dep=1`; fuses sub+exp |
+| `vaxpy` | fused `α·x + y` | f16, f32 | `pass → pass` | `Pg` | `K × vaxpy` | `#mi=K` / `dep=1` |
+| `vlrelu` / `vprelu` | leaky / parametric ReLU | f16, f32 | `pass → pass` | `Pg` | `K × vlrelu`/`vprelu` | `#mi=K` / `dep=1` |
+| `vmull` | widening 32×32→64 multiply (hi/lo) | i32/u32 | `pass → pass` (hi+lo pair) | `Pg` | `K × vmull` | `#mi=K` / `dep=1`; two result regs |
+| `vmula` | fused multiply-accumulate | i8–i32, f16/bf16, f32 | `pass → pass` | `Pg` | `K × vmula` | `#mi=K` / `dep=1`; not always = vmul+vadd |
 
 **Notes.** `chistv2` is the MoE histogram/count primitive: it naturally writes
 two halves (`Bin_N0`/`Bin_N1`), so `pto.as` keeps the logical op single and
@@ -594,15 +611,15 @@ one logical mask over `L`; `pto.as` fans it out and applies, to the predicate,
 the *companion* of whatever transform it applied to the data. Budget: **8 pregs**
 total, target working set `<= 6`.
 
-| `pto.vmi` op | Functional description | Datatypes | Layout | Mask in | `pto.vmi -> pto.mi` mapping | Cost (`#mi` / VL-util / note) |
+| `pto.vmi` op | Functional description | Datatypes | Layout in→out | Mask in | `pto.vmi -> pto.mi` mapping | Cost (`#mi` / `dep` / util) |
 |---|---|---|---|---|---|---|
-| `pset` | materialize mask from named pattern | b8/b16/b32 | static pattern | `gen` | `1 × pset_b* "PAT_*"` | `#mi=1` / n/a / axis-invariant `PAT_ALL` shared across K |
-| `pge` | lane-count / tail pattern mask | b8/b16/b32 | static tail | `gen` | `1 × pge_b* "PAT_VLn"` | `#mi=1` / n/a / cheap to recompute |
-| `plt` | data-dependent tail mask (post-update) | b8/b16/b32 | dynamic tail (1D-only) | `gen` (from scalar) | `1 × plt_b*` (+ carry scalar) | `#mi=1` / n/a / +1 preg; recompute > keep |
-| `ppack` | radix-2 narrowing pack (parity companion) | b16→b32 view | companion of `vcvt EVEN/ODD` widen | `pred` | `ppack PART=LOWER/HIGHER` | `#mi=1–2` / n/a / keeps LSB of each 2-bit group |
-| `punpack` | radix-2 widening unpack (bit-extend) | b16→b32 view | companion of widened value | `pred` | `punpack PART=LOWER/HIGHER` | `#mi=1` / n/a / zero-extend 1-bit→2-bit group |
-| `pintlv` / `pdintlv` | interleave / deinterleave predicate | b8/b16/b32 | companion of `vsts INTLV` / `vlds DINTLV` | `pred` | `pintlv_b*` / `pdintlv_b*` | `#mi=1` / n/a / merge/split governing pred |
-| `pand` `por` `pnot` | predicate logical ops (gated) | b8/b16/b32 | follows governed value | `Pg req` | `K' × p<op>` | `#mi=K'` / n/a / gated by governing pred |
+| `pset` | materialize mask from named pattern | b8/b16/b32 | `(none) → infer(pattern)` | `gen` | `1 × pset_b* "PAT_*"` | `#mi=1` / `dep=1`; `PAT_ALL` shared across K |
+| `pge` | lane-count / tail pattern mask | b8/b16/b32 | `(none) → infer(tail)` | `gen` | `1 × pge_b* "PAT_VLn"` | `#mi=1` / `dep=1`; cheap to recompute |
+| `plt` | data-dependent tail mask (post-update) | b8/b16/b32 | `(scalar) → infer(tail)` (1D-only) | `gen` (from scalar) | `1 × plt_b*` (+ carry scalar) | `#mi=1` / `dep=1`; +1 preg |
+| `ppack` | radix-2 narrowing pack (parity companion) | b16→b32 view | `consume(parity) → infer(parity)` | `pred` | `ppack PART=LOWER/HIGHER` | `#mi=1–2` / `dep=1`; keeps LSB of each 2-bit group |
+| `punpack` | radix-2 widening unpack (bit-extend) | b16→b32 view | `consume(parity) → infer(parity)` | `pred` | `punpack PART=LOWER/HIGHER` | `#mi=1` / `dep=1`; zero-extend 1-bit→2-bit group |
+| `pintlv` / `pdintlv` | interleave / deinterleave predicate | b8/b16/b32 | `consume(parity) → infer(parity)` | `pred` | `pintlv_b*` / `pdintlv_b*` | `#mi=1` / `dep=1`; merge/split governing pred |
+| `pand` `por` `pnot` | predicate logical ops (gated) | b8/b16/b32 | `pass → pass` (follows governed) | `Pg req` | `K' × p<op>` | `#mi=K'` / `dep=1`; gated by governing pred |
 
 **Notes.** Full (all-active) masks are axis-invariant: `ppack`/`pdintlv` of a
 `PAT_ALL` is still `PAT_ALL`, so a region with no tail and no data-dependent mask
@@ -638,9 +655,10 @@ hand-author would write (P6).
 ```
 
 Lowering (`K = 4`): `(K-1)=3 × vmax` fold + `1 × vcmax` reduce + `1 × vdup`
-broadcast + `K × (vsub, vexp)`. `#mi ≈ (K-1)+1+1 + 2K = 13`. VL-util: 100% on the
-eltwise, `1/L` at the reduced scalar. No UB roundtrip (the `vdup` keeps the
-broadcast register-resident).
+broadcast + `K × (vsub, vexp)`. `#mi ≈ (K-1)+1+1 + 2K = 13`; `dep ≈ K + 1 + 1 + 2`
+(the serial `vmax` fold dominates the critical path). util `1/L` at the reduced
+scalar (eltwise full-width). No UB roundtrip (the `vdup` keeps the broadcast
+register-resident).
 
 ### 15.2 Per-row softmax sum/normalize (Group 6 + 7, R4a + grouped bcast)
 
@@ -652,9 +670,10 @@ broadcast register-resident).
 ```
 
 Lowering: `K × vcgadd` (cheap, one op/reg, output `R/E_v` per reg) → grouped
-broadcast: **UB roundtrip** default `vsts` partials + `vlds BRC_BLK` (`2K` ops,
-9c, pair 1+1) → `K × vdiv`. `#mi ≈ K + 2K + K = 4K`. The grouped-bcast leg is the
-cost-model decision (RoT-1: UB roundtrip unless tiny + issue-bound → `vselr`).
+broadcast: **UB roundtrip** default `vsts` partials + `vlds BRC_BLK` → `K × vdiv`.
+`#mi ≈ K + 2K + K = 4K`; `dep ≈ 1 (vcgadd) + 2 (st→ld) + 1 (vdiv) = 4`. The
+grouped-bcast leg is the cost-model decision (RoT-1: UB roundtrip unless tiny +
+issue-bound → `vselr`).
 
 ### 15.3 Parity widen + bias-add + contiguous store with tail (Group 8 + 1 + 10)
 
@@ -669,10 +688,11 @@ pto.vmi.vsts %s, %y_ub, %p              : !pto.vmi.vreg<128xi32>, !pto.mi.ptr<i3
 Lowering: the `vlds` is **unpredicated** (Part 3) — the tail `%p` is not applied
 on the load; it first governs the predicated `vcvt`/`vadd` and the store. `vcvt`
 → `vcvt EVEN` + `vcvt ODD` (`2K`) + predicate `ppack LOWER`/`HIGHER` (2 pregs);
-`vadd` per parity reg; contiguous store → `vstsx2 INTLV_B32` (12c) + `pintlv`
-predicate merge. The author wrote one `plt` and four ops; the EVEN/ODD split,
-per-half predication, and interleave-on-store are all derived. Budget: 2 vregs +
-2 pregs live (1 each with per-reg fusion).
+`vadd` per parity reg; contiguous store → `vstsx2 INTLV_B32` + `pintlv`
+predicate merge. `#mi ≈ 2K (cvt) + 2 (ppack) + K (vadd) + K (store)`; `dep ≈ 4`
+(cvt→ppack→vadd→store). The author wrote one `plt` and four ops; the EVEN/ODD
+split, per-half predication, and interleave-on-store are all derived. Budget:
+2 vregs + 2 pregs live (1 each with per-reg fusion).
 
 ### 15.4 Multi-dtype quant (Group 8, one `vcvt` vs cast ladder)
 
@@ -765,31 +785,33 @@ can express it and `pto.as` lowers it to the same `pto.mi` stream (P6).
 
 ## Part 17 — Appendix: consolidated cost cheat-sheet
 
-Per logical value, `K` = reg fan-out. Mirrors design-exploration §5.4; cycle
-terms are A5 `Ascend910_9599` CA simulator (*not silicon*).
+Per logical value, `K` = reg fan-out. **Instruction-count based** (no cycle
+numbers): `#mi` = ops emitted; `dep` = longest dependency path (critical-path
+depth in dependent ops); `util` shown only when **< 100%** (else full-width).
 
-| vmi op / pattern | lowering | `#mi` / value | extra ld/st | scratch | VL-util | dominant cost |
+| vmi op / pattern | lowering | `#mi` / value | `dep` | extra ld/st | scratch | util (if <100%) |
 |---|---|---|---|---|---|---|
-| `vadd/vmul/vsel/...` (R1) | `K ×` arith | `K` | 0 | 0 | 100% | `K×7c` |
-| `vadds/...` (vec-scalar) | `K ×` arith | `K` | 0 | 0 | 100% | `K×7c` |
-| `vdup` / `vbr` (ungrouped) | `vdup` (reg) | `1` | 0 | 0 | replicate | cheap |
-| `arange`/`vci` | `vci` | `1`/chunk | 0 | 0 | 100% | cheap |
-| `vlds`/`vsts` contiguous | `K × 9c` | `K` | — | 0 | 100% | bandwidth; 1+1 pairing |
-| `vlds DINTLV` / `vsts INTLV` | `K ×` (9 / 12c) | `K` | — | 0 | 100% | INTLV 12c |
-| `vcvt` 16↔32 (parity) | `2K × vcvt EVEN/ODD` + `ppack` | `2K` | 0 | 0 | 100% | parity widen |
-| `vcvt` 8↔32 (radix-4) | `UNPK/PK4` + `vcvt P0` (+`vselr` narrow) | ~2–3 | 0 (reg path) | index/zero reg | 100% | see §12 |
-| `vcvt` quant f32→U | per-dtype cast chain + `PK4_B32` | `K..3K` | 0 | 0 | 100% | chain depth by dtype |
-| `vreduce_*` grouped (R4a) | `K × vcg*` | `K` | 0 | 0 | `R/E_v` out | **cheap** |
-| `vreduce_*` full (R4b) | `(K-1) vadd + vcadd` | `K` | 0 | 0 | `1/L` out | fold chain |
-| `vreduce_*` unaligned (R4d) | `[C]` materialize + reduce | `K`+ld/st | +2 | UB | low | last resort |
-| grouped `vbr` — UB roundtrip | `vsts` + `vlds BRC_BLK` | `2K` | +2 | UB block | `C/E_v` | **decision** |
-| grouped `vbr` — `vselr` | `vci`+`vmuls` + `K× vselr` | `K`+setup | 0 | index vreg | `C/E_v` | ~4× thruput |
-| grouped `vbr` — masked | per-group op under masks | ∝#groups | 0 | mask pregs | `C/E_v` | scales w/ #groups |
-| `chistv2` | `Bin_N0`+`Bin_N1` + accumulate | `~2K` | INTLV merge | — | `half` | per-half pred |
-| `vgather/vscatter` (C) | gather/scatter | `K` | — | index | data-dep | 17–28c, ~0.1/cyc |
-| predicate `pset/pge` | `pset`/`pge` | `1` | — | — | n/a | `PAT_ALL` shared |
-| predicate companion (`ppack`/`pintlv`/...) | radix-2 reshape | `1–2` | — | — | n/a | follows data axis |
-| MERGE-mode delta (A5) | zeroing op + `pnot` + `K× vor`/`vsel` | `+1+K` | 0 | +1 (`dst_old`) | n/a | ~free on A6 (native merge) |
+| `vadd/vmul/vsel/...` (R1) | `K ×` arith | `K` | `1` | 0 | 0 | — |
+| `vadds/...` (vec-scalar) | `K ×` arith | `K` | `1` | 0 | 0 | — |
+| `vdup` / `vbr` (ungrouped) | `vdup` (reg) | `1` | `1` | 0 | 0 | replicate |
+| `arange`/`vci` | `vci` | `1`/chunk | `1` | 0 | 0 | — |
+| `vlds`/`vsts` contiguous | `K ×` ld/st | `K` | `1` | — | 0 | — |
+| `vlds DINTLV` / `vsts INTLV` | `K ×` (DINTLV / INTLV) | `K` | `1` | — | 0 | — |
+| `vcvt` 16↔32 (parity) | `2K × vcvt EVEN/ODD` + `ppack` | `2K` | `2` | 0 | 0 | — |
+| `vcvt` 8↔32 (radix-4) | `UNPK/PK4` + `vcvt P0` (+`vselr` narrow) | ~2–3 | `2–3` | 0 (reg path) | index/zero reg | — |
+| `vcvt` quant f32→U | per-dtype cast chain + `PK4_B32` | `K..3K` | `1–4` | 0 | 0 | — |
+| `vreduce_*` grouped (R4a) | `K × vcg*` | `K` | `1` | 0 | 0 | `R/E_v` out |
+| `vreduce_*` full, fold (R4b) | `(K-1) vadd + vcadd` | `K` | `K` | 0 | 0 | `1/L` out |
+| `vreduce_*` full, partial (R4b) | `K× vcadd + combine` | `K` | `1+⌈log₂K⌉` | 0 | 0 | `1/L` out |
+| `vreduce_*` unaligned (R4d) | `[C]` materialize + reduce | `K`+ld/st | `2–3` | +2 | UB | low |
+| grouped `vbr` — UB roundtrip | `vsts` + `vlds BRC_BLK` | `2K` | `2` | +2 | UB block | `C/E_v` |
+| grouped `vbr` — `vselr` | `vci`+`vmuls` + `K× vselr` | `K`+setup | `3` | 0 | index vreg | `C/E_v` |
+| grouped `vbr` — masked | per-group op under masks | ∝#groups | ∝#groups | 0 | mask pregs | `C/E_v` |
+| `chistv2` | `Bin_N0`+`Bin_N1` + accumulate | `~2K` | `2–3` | INTLV merge | — | `half` |
+| `vgather/vscatter` (C) | gather/scatter | `K` | `1` | — | index | data-dep |
+| predicate `pset/pge` | `pset`/`pge` | `1` | `1` | — | — | — |
+| predicate companion (`ppack`/`pintlv`/...) | radix-2 reshape | `1–2` | `1` | — | — | — |
+| MERGE-mode delta (A5) | zeroing op + `pnot` + `K× vor`/`vsel` | `+1+K` | `+2` | 0 | +1 (`dst_old`) | — |
 
 **Reading the table.** Cheap, register-fuse-friendly: eltwise (R1), ungrouped
 broadcast (`vdup`), VLane group reduce (R4a). Cost-model decision points: grouped
