@@ -12,9 +12,8 @@
 3. [Use Case 2: TInsert — Unaligned Sub-Tile Store](#3-use-case-2-tinsert--unaligned-sub-tile-store)
 4. [Use Case 3: TQuant — Compact Reduce-Max Partial Write](#4-use-case-3-tquant--compact-reduce-max-partial-write)
 5. [Use Case 4: Sorted Unique Dedup — Adjacent Shift vcmp + vsqz](#5-use-case-4-sorted-unique-dedup--adjacent-shift-vcmp--vsqz)
-6. [Use Case 5: Radix TopK GatherConcat — Accumulator Scan & Select](#6-use-case-5-radix-topk-gatherconcat--accumulator-scan--select)
-7. [pto.vmi Surface Mapping](#7-pto-vmi-surface-mapping)
-8. [pto.as Lowering Decision Summary](#8-pto-as-lowering-decision-summary)
+6. [pto.vmi Surface Mapping](#6-pto-vmi-surface-mapping)
+7. [pto.as Lowering Decision Summary](#7-pto-as-lowering-decision-summary)
 
 ---
 
@@ -308,93 +307,9 @@ vstur:  writes [1, 3, 5, 7, 9] to output stream  (only first count elements are 
 
 ---
 
-## 6. Use Case 5: Radix TopK GatherConcat — Accumulator Scan & Select
+## 6. pto.vmi Surface Mapping
 
-**Semantic**: In the xson radix topk implementation (Phase 5), the algorithm scans elements across multiple tile chunks, selects GT (greater-than) and EQ (equal) elements using `TGATHER`, then **accumulates** the selected indices into a growing output buffer using `TCONCAT_IMPL`. The unaligned store aspect (writing at a non-aligned destination offset within a tile) is already covered by **TInsert** (Use Case 2) — `vstus+vstas` handles sub-tile insertion at misaligned positions. What is unique about this pattern is the **byte-count accumulator loop** that tracks how many elements have been selected so far and concatenates each new gather result at the current offset.
-
-### Phase 5: Per-Chunk Gather + Concat Accumulation
-
-```cpp
-// Six-arg TCONCAT_IMPL: concatenate a gathered segment into an accumulator
-// TCONCAT_IMPL(segTmp, gtSeg, dstG, idxGtOut, idxGtAcc, concatG)
-//   segTmp    — output segment tile (holds concatenated result)
-//   gtSeg     — input gathered GT segment
-//   dstG      — destination accumulator tile
-//   idxGtOut  — output byte-count (updated by concat to reflect new total)
-//   idxGtAcc  — input byte-count accumulator (where to start writing in dstG)
-//   concatG   — scratch tile for concat internals
-
-for (unsigned sub = 0; sub < nSubChunks; ++sub) {
-    // Step 1: Gather GT elements from current chunk
-    TGATHER<GatherDstTile, GatherSrcTile, PackedU16Tile, ConcatTile, TmpCmpTile, CmpMode::GT>(
-        dstG, srcG, packedThrU, concatG, tmpG, base + sub);
-    
-    // Step 2: Concatenate gathered GT indices into accumulator
-    //   This is effectively a TINSERT at offset idxGtAcc (byte-count position)
-    //   — the unaligned store path from Use Case 2 applies here if idxGtAcc is not 32B-aligned
-    TCONCAT_IMPL(segTmp, gtSeg, dstG, idxGtOut, idxGtAcc, concatG);
-    
-    // Step 3: Copy result back for next iteration
-    TMOV(gtSeg, segTmp);
-    TMOV(idxGtAcc, idxGtOut);  // Advance accumulator offset
-}
-```
-
-### Final Five-Arg Merge: GT + EQ into Single Output
-
-```cpp
-// After all chunks are processed, merge GT and EQ segments
-// TCONCAT_IMPL(mergedIdx, gtSeg, eqSeg, idxGtAcc, idxEqAcc)
-//   mergedIdx — final output tile
-//   gtSeg     — accumulated GT indices
-//   eqSeg     — accumulated EQ indices
-//   idxGtAcc  — byte count of GT segment (acts as insertion offset for EQ)
-//   idxEqAcc  — byte count of EQ segment
-TCONCAT_IMPL(mergedIdx, gtSeg, eqSeg, idxGtAcc, idxEqAcc);
-```
-
-### TCONCAT_IMPL Physical Implementation
-
-The concat operation writes the first segment at aligned row offsets, then writes the second segment starting at `validCols0` — which is the **TInsert pattern** from Use Case 2 (unaligned store if `validCols0` is not 32B-aligned):
-
-```cpp
-// From TConcat.hpp — concatenating src1 after src0
-for (uint16_t i = 0; i < validRows; ++i) {
-    // First segment: src0 — aligned write at row offsets [0..validCols0)
-    for (uint16_t j = 0; j < repeatTimes0; ++j) {
-        vlds(vreg_0, src0Ptr, i * RowStride0 + j * ElementsPerRepeat, NORM);
-        vsts(vreg_0, dstPtr, i * RowStrideDst + j * ElementsPerRepeat, distValue, preg);
-    }
-
-    mem_bar(VST_VLD);  // Barrier: first segment must land in UB before second starts
-
-    // Second segment: src1 — written starting at position validCols0
-    //   This is exactly the TINSERT pattern: write at a (possibly misaligned) offset within a tile row
-    //   If validCols0 * sizeof(T) is 32B-aligned → vsts with predicate
-    //   If validCols0 * sizeof(T) is NOT 32B-aligned → vstus + vstas (Use Case 2)
-    for (uint16_t j = 0; j < repeatTimes1; ++j) {
-        vlds(vreg_1, src1Ptr, i * RowStride1 + j * ElementsPerRepeat, NORM);
-        // Aligned-path: vsts(vreg_1, dstPtr, offset + validCols0 + j * EPR, distValue, preg)
-        // Unaligned-path: vstus(ureg, count, vreg_1, pdst, POST_UPDATE) per chunk
-        //                  + vstas(ureg, pdst, 0, POST_UPDATE) flush per row
-        vsts(vreg_1, dstPtr, i * RowStrideDst + validCols0 + j * ElementsPerRepeat, distValue, preg);
-    }
-}
-```
-
-### Key Insight
-
-- **Byte-count accumulator loop**: `idxGtAcc` and `idxGtOut` are scalar registers that track how many bytes have been concatenated so far. Each iteration advances `idxGtAcc = idxGtOut`, so the next chunk's gather result is inserted at the correct offset — this is the **scan-and-select** pattern unique to topk.
-- **TINSERT covers the unaligned store**: Writing the second segment at offset `validCols0` within a tile row is exactly the TInsert problem from Use Case 2. If `validCols0` is not 32B-aligned, the same `vstus+vstas` streaming pattern applies. No separate scatter pattern is needed — **TInsert already solves it**.
-- **mem_bar(VST_VLD)**: The memory barrier between the first segment write and the second segment write ensures UB visibility — the first segment must be committed before the second can be written after it.
-- **TGATHER produces sparse input**: Each `TGATHER` call uses `vsqz+vstur+vstar` (Use Case 4 pattern) to compact selected indices into a dense segment, which then feeds into `TCONCAT_IMPL` as the second segment input.
-- **Final merge is a two-segment concat**: The five-arg `TCONCAT_IMPL(mergedIdx, gtSeg, eqSeg, idxGtAcc, idxEqAcc)` concatenates EQ after GT — `idxGtAcc` tells where EQ starts. This produces the final topk result as one contiguous sequence.
-
----
-
-## 7. pto.vmi Surface Mapping
-
-At the pto.vmi level, these five use cases map to surface ops that **never expose** the aligned/unaligned distinction:
+At the pto.vmi level, these four use cases map to surface ops that **never expose** the aligned/unaligned distinction:
 
 | Use Case | pto.vmi Surface Op | Surface Signature | Hidden Complexity |
 |----------|--------------------|-------------------|-------------------|
@@ -402,17 +317,16 @@ At the pto.vmi level, these five use cases map to surface ops that **never expos
 | TInsert | `TINSERT` | `tinsert(dst_tile, src_tile, row, col, shape)` | vstus+vstas vs vsts decision based on col/stride alignment |
 | TQuant | `TQUANT` (reduce-max part) | `tquant_reduce_max(src_tile) → packed_max_tile` | vstus compact streaming + padding + vstas flush |
 | Unique Dedup | `TUNIQUE` | `tunique(dst_tile, sorted_src_tile)` | vldas+vldus for shifted predecessor load + vcmp_ne + vsqz + vstur/vstar compact stream |
-| GatherConcat | `TCONCAT` + `TGATHER` | `tgather+ tconcat(acc, segment, offset)` | TINSERT (vstus+vstas) at accumulator offset + byte-count accumulator loop |
 
 **Principle**: The pto.vmi programmer writes `TEXTRACT(dst, src, row, col, shape)` and the compiler decides:
 - If `col * sizeof(T) % 32 == 0` → use `vlds+vsts` (aligned path)
 - If `col * sizeof(T) % 32 != 0` → use `vldas+vldus` + `vsts` (unaligned load path)
 
-Similarly for `TINSERT`, `TQUANT`, `TGATHER` — the surface op is one thing, the physical implementation varies.
+Similarly for `TINSERT`, `TQUANT`, `TUNIQUE` — the surface op is one thing, the physical implementation varies.
 
 ---
 
-## 8. pto.as Lowering Decision Summary
+## 7. pto.as Lowering Decision Summary
 
 When `pto.as` lowers pto.vmi surface ops to pto.mi physical instructions, it makes these decisions:
 
@@ -460,17 +374,6 @@ Compact output write:
       └─ For the shifted predecessor load in unique dedup:
           → vldas(ureg_shift, shiftedPtr) + vldus(vreg_prev, ureg_shift, shiftedPtr)
             (1-element shift produces misaligned address — Use Case 1 pattern)
-```
-
-### Decision 5: Concat at Accumulator Offset (TInsert)
-
-```
-TCONCAT_IMPL(acc, segment0, segment1, offset):
-  → vlds + vsts for segment0 (aligned, at offset 0)
-  → mem_bar(VST_VLD)
-  → TINSERT for segment1 at accumulator offset (same as Use Case 2):
-      ├─ offset * sizeof(T) % 32 == 0  → vlds + vsts with predicate  [aligned]
-      └─ offset * sizeof(T) % 32 != 0  → vlds + vstus + vstas per row  [unaligned TInsert]
 ```
 
 ---
