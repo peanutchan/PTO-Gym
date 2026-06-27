@@ -11,7 +11,7 @@
 2. [Use Case 1: TExtract — Unaligned Sub-Tile Load](#2-use-case-1-textract--unaligned-sub-tile-load)
 3. [Use Case 2: TInsert — Unaligned Sub-Tile Store](#3-use-case-2-tinsert--unaligned-sub-tile-store)
 4. [Use Case 3: TQuant — Compact Reduce-Max Partial Write](#4-use-case-3-tquant--compact-reduce-max-partial-write)
-5. [Use Case 4: TGather — Sparse Squeeze-Stream Output](#5-use-case-4-tgather--sparse-squeeze-stream-output)
+5. [Use Case 4: Sorted Unique Dedup — Adjacent Shift vcmp + vsqz](#5-use-case-4-sorted-unique-dedup--adjacent-shift-vcmp--vsqz)
 6. [Use Case 5: Radix TopK GatherConcat — Accumulator Scan & Select](#6-use-case-5-radix-topk-gatherconcat--accumulator-scan--select)
 7. [pto.vmi Surface Mapping](#7-pto-vmi-surface-mapping)
 8. [pto.as Lowering Decision Summary](#8-pto-as-lowering-decision-summary)
@@ -194,47 +194,123 @@ vstas(ureg_max, writePtr, 0, POST_UPDATE);  // Single flush after all rows
 
 ---
 
-## 5. Use Case 4: TGather — Sparse Squeeze-Stream Output
+## 5. Use Case 4: Sorted Unique Dedup — Adjacent Shift vcmp + vsqz
 
-**Semantic**: Gather elements from source rows where a mask pattern selects active columns, then **compact the active elements to a contiguous stream** using `vsqz` (squeeze) and `vstur/vstar` (unaligned compact store).
+**Semantic**: Given a **sorted** 1D vector in UB, compute the unique (deduplicated) elements by loading the same vector twice — once at the original offset and once shifted by 1 element — then comparing adjacent pairs with `vcmp_ne`. The comparison produces a predicate mask where true lanes mark "first occurrence" elements (elements that differ from their predecessor). `vsqz` compacts these predicate-true lanes to the front, and `vstur/vstar` streams the compacted unique values to the output buffer.
 
-### Unique Example: Column-Gather with Squeeze-Stream
+This is the canonical `vsqz+vstur/vstar` pattern — it demonstrates how **dynamic-count compact output** works when the number of surviving elements is unknown at compile time.
+
+### Problem Setup
+
+```
+Input:  sorted_vec = [1, 1, 1, 3, 3, 5, 5, 5, 7, 9, 9, ...]  (sorted, may have duplicates)
+Output: unique_vec = [1, 3, 5, 7, 9, ...]  (compact, no duplicates)
+```
+
+The key observation: in a sorted list, an element is a "first occurrence" (unique representative) if it differs from its immediate predecessor. Element at index `i` is unique iff `sorted_vec[i] != sorted_vec[i-1]`. Index 0 is always unique (no predecessor).
+
+### Physical Implementation: Shift-Load + vcmp_ne + vsqz + vstur/vstar
 
 ```cpp
-constexpr uint8_t SPR_AR_VALUE = 74;
-constexpr auto sprValue = std::integral_constant<::Spr, static_cast<::Spr>(SPR_AR_VALUE)>();
-sprclr(sprValue);              // Clear the address register for streaming
+// --- Sorted Unique Dedup on A5 ---
+// Input:  __ubuf__ T *sortedPtr   — sorted 1D vector, length N
+// Output: __ubuf__ T *uniquePtr   — compact unique output (stream-written)
 
-MaskReg dstPg0 = GetMaskVal<T, maskPattern>();
-RegTensor<T> dstReg;
-MaskReg executeMask;
-UnalignReg ureg;
+using RegT = RegTensor<T>;        // e.g. bfloat16 or half
+constexpr uint32_t VL_ELEMS = CCE_VL / sizeof(T);  // Elements per vector load (128 for BF16)
+constexpr uint32_t REPEAT_BYTE = 32;               // 32B alignment unit
 
-for (uint16_t i = 0; i < validRow; ++i) {
-    for (uint16_t j = 0; j < repeatTimes; ++j) {
-        loadMask = CreatePredicate<T>(maskValue);
-        vlds(srcReg, srcPtr + i * srcStride, j * nElemPerVL, NORM);  // Load full row chunk
-        pand(executeMask, dstPg0, loadMask, loadMask);                // Intersect mask + predicate
-        vsqz(dstReg, srcReg, executeMask, MODE_STORED);              // Squeeze: compact active lanes to front
-        vstur(ureg, dstReg, dstPtr, POST_UPDATE);                    // Write compacted vreg to stream
+__ubuf__ RegT *sortedAddr = (__ubuf__ RegT *)sortedPtr;
+__ubuf__ RegT *uniqueAddr = (__ubuf__ RegT *)uniquePtr;
+uint32_t totalElems = N;
+uint32_t nChunks = CeilDivision(totalElems, VL_ELEMS);
+
+__VEC_SCOPE__
+{
+    RegT vreg_curr, vreg_prev, vreg_unique;
+    MaskReg preg_all, preg_ne, preg_first;
+    UnalignReg ureg;
+
+    // Clear stream address register for compact output
+    constexpr uint8_t SPR_AR_VALUE = 74;
+    sprclr(SPR_AR_VALUE);
+
+    // First element is always unique — special-case the first chunk
+    preg_first = CreatePredicate<T>(1);  // Only lane 0 is true for "no predecessor"
+
+    for (uint32_t chunk = 0; chunk < nChunks; ++chunk) {
+        uint32_t chunkOff = chunk * VL_ELEMS;
+        uint32_t elemCount = min(VL_ELEMS, totalElems - chunkOff);
+        preg_all = CreatePredicate<T>(elemCount);
+
+        // Load current chunk
+        vlds(vreg_curr, sortedAddr, chunkOff, NORM);
+
+        // Build "not-equal-to-predecessor" mask
+        if (chunk == 0) {
+            // Chunk 0: element[0] has no predecessor → always unique
+            //   For i>0 within chunk 0: compare sorted[i] vs sorted[i-1]
+            //   Use vldas+vldus for shifted load (offset 1 byte = not 32B-aligned for BF16)
+            UnalignReg ureg_shift;
+            __ubuf__ RegT *shiftedPtr = sortedAddr + 1;  // Shift by 1 element (not 32B-aligned!)
+            vldas(ureg_shift, shiftedPtr);                // Prime unaligned load for predecessor
+            vldus(vreg_prev, ureg_shift, shiftedPtr);    // Load sorted[0..VL_ELEMS-2] as predecessor of sorted[1..VL_ELEMS-1]
+            vcmp_ne(preg_ne, vreg_curr, vreg_prev, preg_all);  // ne mask for i>=1
+            // Combine: lane 0 = always unique (no pred), lanes 1+ = ne result
+            por(preg_ne, preg_first, preg_ne);  // Union: first-element flag + ne mask
+        } else {
+            // Chunk k>0: all elements have a predecessor
+            //   predecessor of sorted[chunk*VL] is sorted[chunk*VL - 1]
+            //   Load predecessor from previous chunk's last element + current shifted view
+            //   Simplest: load the shifted window from (chunkOff - 1)
+            uint32_t prevOff = chunkOff - 1;  // Predecessor starts 1 element before current chunk
+            // NOTE: prevOff may not be 32B-aligned! Need vldas+vldus
+            UnalignReg ureg_shift;
+            __ubuf__ RegT *shiftedPtr = sortedAddr + prevOff;
+            vldas(ureg_shift, shiftedPtr);
+            vldus(vreg_prev, ureg_shift, shiftedPtr);
+            vcmp_ne(preg_ne, vreg_curr, vreg_prev, preg_all);  // All lanes: ne with predecessor
+        }
+
+        // Squeeze: compact unique elements (where preg_ne is true) to front of vreg
+        vsqz(vreg_unique, vreg_curr, preg_ne, MODE_STORED);
+
+        // Stream-write compacted unique values to output
+        vstur(ureg, vreg_unique, uniqueAddr, POST_UPDATE);
     }
+
+    // Finalize the compact output stream
+    vstar(ureg, uniqueAddr);
 }
-vstar(ureg, dstPtr);  // Finalize the compact output stream
+```
+
+### Visual Walkthrough
+
+```
+sorted: [1, 1, 1, 3, 3, 5, 5, 5, 7, 9, 9, ...]
+         ↓  ↓  ↓  ↓  ↓  ↓  ↓  ↓  ↓  ↓  ↓
+prev:   [_, 1, 1, 1, 3, 3, 5, 5, 5, 7, 9, ...]  (shifted by 1)
+vcmp_ne:[T, F, F, T, F, T, F, F, T, T, F, ...]  (T = differs from predecessor)
+vsqz:   [1, 3, 5, 7, 9, _, _, _, _, _, _, ...]  (compact T-lanes to front)
+vstur:  writes [1, 3, 5, 7, 9] to output stream  (only first count elements are meaningful)
 ```
 
 ### Key Insight
 
-- **vsqz semantics**: `vsqz(dstReg, srcReg, executeMask, MODE_STORED)` takes all lanes where `executeMask` is true and packs them to the front of `dstReg`. It returns the post-squeeze count as an SSA i32 (stored in a scalar register).
-- **vstur semantics**: `vstur(ureg, dstReg, dstPtr, POST_UPDATE)` writes the **entire squeezed vreg** to the stream — but only the first `count` elements are meaningful (the rest are garbage from inactive lanes). The stream position advances by `count * sizeof(T)`.
-- **vstar semantics**: `vstar(ureg, dstPtr)` flushes the UnalignReg stream and finalizes the output. Without this, the gathered elements would be incomplete.
-- **sprclr + SPR_AR_VALUE**: The scalar address register (SPR) is cleared before the loop to reset the streaming position. `vstur` uses `POST_UPDATE` to auto-advance `dstPtr`.
-- **Comparison with TQuant**: Both patterns write compact data to UB, but TQuant uses `vstus` (explicit count) because the count is known at compile-time (groupsPerRow). TGather uses `vsqz+vstur` because the count is dynamic (depends on how many lanes satisfy the mask predicate at runtime).
+- **Adjacent shift requires unaligned load**: Loading the "predecessor" vector (shifted by 1 element from the base) produces a UB address that is **not 32B-aligned** (for BF16, 1 element = 2 bytes, so offset 2 bytes from 32B boundary). This is exactly the `vldas+vldus` pattern from Use Case 1 (TExtract), applied here for a **1D shift-load** rather than a 2D sub-tile extraction.
+- **vsqz produces dynamic count**: The number of unique elements in each chunk is unknown at compile time — it depends on the data distribution. `vsqz` returns the post-squeeze count as an SSA i32, which `vstur` uses implicitly (it writes only `count` meaningful elements from the squeezed vreg).
+- **vstur/vstar for compact streaming**: The output is a contiguous stream of unique values — each chunk's `vsqz` result is appended via `vstur(POST_UPDATE)`, and `vstar` finalizes the total stream. This contrasts with `vstus+vstas` (Use Case 3, TQuant) where the count is known at compile time.
+- **Comparison across use cases**:
+  - **TQuant** (Use Case 3): `vstus(ureg, knownCount, vreg, ptr, POST_UPDATE)` — **static count**, explicit parameter
+  - **Unique dedup** (Use Case 4): `vsqz + vstur(ureg, vreg, ptr, POST_UPDATE)` — **dynamic count**, vsqz decides how many elements survive
+  - **TExtract** (Use Case 1): `vldas+vldus` for **unaligned load of source** — same ISA pair, but for reading misaligned data
+  - **Unique dedup** also uses `vldas+vldus` for the shifted predecessor load — combining **unaligned load + squeeze-stream store** in one kernel
 
 ---
 
 ## 6. Use Case 5: Radix TopK GatherConcat — Accumulator Scan & Select
 
-**Semantic**: In the xson radix topk implementation (Phase 5), the algorithm scans elements across multiple tile chunks, selects GT (greater-than) and EQ (equal) elements using `TGATHER`, then **accumulates** the selected indices into a growing output buffer using `TCONCAT_IMPL`. This is the most complex unaligned pattern — combining gather, squeeze, concat, and byte-count tracking.
+**Semantic**: In the xson radix topk implementation (Phase 5), the algorithm scans elements across multiple tile chunks, selects GT (greater-than) and EQ (equal) elements using `TGATHER`, then **accumulates** the selected indices into a growing output buffer using `TCONCAT_IMPL`. The unaligned store aspect (writing at a non-aligned destination offset within a tile) is already covered by **TInsert** (Use Case 2) — `vstus+vstas` handles sub-tile insertion at misaligned positions. What is unique about this pattern is the **byte-count accumulator loop** that tracks how many elements have been selected so far and concatenates each new gather result at the current offset.
 
 ### Phase 5: Per-Chunk Gather + Concat Accumulation
 
@@ -254,11 +330,13 @@ for (unsigned sub = 0; sub < nSubChunks; ++sub) {
         dstG, srcG, packedThrU, concatG, tmpG, base + sub);
     
     // Step 2: Concatenate gathered GT indices into accumulator
+    //   This is effectively a TINSERT at offset idxGtAcc (byte-count position)
+    //   — the unaligned store path from Use Case 2 applies here if idxGtAcc is not 32B-aligned
     TCONCAT_IMPL(segTmp, gtSeg, dstG, idxGtOut, idxGtAcc, concatG);
     
     // Step 3: Copy result back for next iteration
     TMOV(gtSeg, segTmp);
-    TMOV(idxGtAcc, idxGtOut);
+    TMOV(idxGtAcc, idxGtOut);  // Advance accumulator offset
 }
 ```
 
@@ -277,35 +355,40 @@ TCONCAT_IMPL(mergedIdx, gtSeg, eqSeg, idxGtAcc, idxEqAcc);
 
 ### TCONCAT_IMPL Physical Implementation
 
-The concat operation physically uses `vlds + vscatter` for the second segment (writing at non-contiguous positions starting from `validCols0`):
+The concat operation writes the first segment at aligned row offsets, then writes the second segment starting at `validCols0` — which is the **TInsert pattern** from Use Case 2 (unaligned store if `validCols0` is not 32B-aligned):
 
 ```cpp
-// From TConcat.hpp — the scatter path for concatenating src1 after src0
+// From TConcat.hpp — concatenating src1 after src0
 for (uint16_t i = 0; i < validRows; ++i) {
-    // First segment: src0 — written at aligned row offsets [0..validCols0)
+    // First segment: src0 — aligned write at row offsets [0..validCols0)
     for (uint16_t j = 0; j < repeatTimes0; ++j) {
         vlds(vreg_0, src0Ptr, i * RowStride0 + j * ElementsPerRepeat, NORM);
         vsts(vreg_0, dstPtr, i * RowStrideDst + j * ElementsPerRepeat, distValue, preg);
     }
-    
-    mem_bar(VST_VLD);  // Barrier between aligned write and scatter write
-    
-    // Second segment: src1 — scattered at positions [validCols0..validCols0+validCols1)
+
+    mem_bar(VST_VLD);  // Barrier: first segment must land in UB before second starts
+
+    // Second segment: src1 — written starting at position validCols0
+    //   This is exactly the TINSERT pattern: write at a (possibly misaligned) offset within a tile row
+    //   If validCols0 * sizeof(T) is 32B-aligned → vsts with predicate
+    //   If validCols0 * sizeof(T) is NOT 32B-aligned → vstus + vstas (Use Case 2)
     for (uint16_t j = 0; j < repeatTimes1; ++j) {
         vlds(vreg_1, src1Ptr, i * RowStride1 + j * ElementsPerRepeat, NORM);
-        vci(vreg_idx, (IndexScalar)(i * RowStrideDst + validCols0 + j * ElementsPerRepeat), INC_ORDER);
-        vscatter(vreg_1, dstPtr, (RegTensor<UnsignedIndexScalar> &)vreg_idx, preg);
+        // Aligned-path: vsts(vreg_1, dstPtr, offset + validCols0 + j * EPR, distValue, preg)
+        // Unaligned-path: vstus(ureg, count, vreg_1, pdst, POST_UPDATE) per chunk
+        //                  + vstas(ureg, pdst, 0, POST_UPDATE) flush per row
+        vsts(vreg_1, dstPtr, i * RowStrideDst + validCols0 + j * ElementsPerRepeat, distValue, preg);
     }
 }
 ```
 
 ### Key Insight
 
-- **Byte-count accumulator tracking**: `idxGtAcc` and `idxGtOut` are scalar registers that track how many bytes have been concatenated so far. They serve as the "insertion offset" for the next chunk's gather results.
-- **TGATHER → TCONCAT_IMPL pipeline**: Each chunk produces a sparse gather result (using `vsqz+vstur` internally), then `TCONCAT_IMPL` concatenates it at the current accumulator position. The loop builds the output incrementally.
-- **mem_bar(VST_VLD)**: A memory barrier between the aligned `vsts` writes (first segment) and the `vscatter` writes (second segment) ensures ordering — the first segment must be visible in UB before the scatter can write after it.
-- **vscatter for concat**: Unlike `vstus` which streams sequentially, `vscatter` writes to specific byte-offset positions computed by `vci` (vector index generation). This allows concatenating at arbitrary positions within a row.
-- **Final merge**: The five-arg `TCONCAT_IMPL` merges GT and EQ segments — `idxGtAcc` tells where the EQ segment starts (immediately after all GT elements). This produces the final topk result as one contiguous sequence.
+- **Byte-count accumulator loop**: `idxGtAcc` and `idxGtOut` are scalar registers that track how many bytes have been concatenated so far. Each iteration advances `idxGtAcc = idxGtOut`, so the next chunk's gather result is inserted at the correct offset — this is the **scan-and-select** pattern unique to topk.
+- **TINSERT covers the unaligned store**: Writing the second segment at offset `validCols0` within a tile row is exactly the TInsert problem from Use Case 2. If `validCols0` is not 32B-aligned, the same `vstus+vstas` streaming pattern applies. No separate scatter pattern is needed — **TInsert already solves it**.
+- **mem_bar(VST_VLD)**: The memory barrier between the first segment write and the second segment write ensures UB visibility — the first segment must be committed before the second can be written after it.
+- **TGATHER produces sparse input**: Each `TGATHER` call uses `vsqz+vstur+vstar` (Use Case 4 pattern) to compact selected indices into a dense segment, which then feeds into `TCONCAT_IMPL` as the second segment input.
+- **Final merge is a two-segment concat**: The five-arg `TCONCAT_IMPL(mergedIdx, gtSeg, eqSeg, idxGtAcc, idxEqAcc)` concatenates EQ after GT — `idxGtAcc` tells where EQ starts. This produces the final topk result as one contiguous sequence.
 
 ---
 
@@ -318,8 +401,8 @@ At the pto.vmi level, these five use cases map to surface ops that **never expos
 | TExtract | `TEXTRACT` | `textract(dst_tile, src_tile, row, col, shape)` | vldas+vldus vs vlds decision based on col alignment |
 | TInsert | `TINSERT` | `tinsert(dst_tile, src_tile, row, col, shape)` | vstus+vstas vs vsts decision based on col/stride alignment |
 | TQuant | `TQUANT` (reduce-max part) | `tquant_reduce_max(src_tile) → packed_max_tile` | vstus compact streaming + padding + vstas flush |
-| TGather | `TGATHER` | `tgather(dst_tile, src_tile, mask)` | vsqz predicate compact + vstur/vstar streaming |
-| GatherConcat | `TCONCAT` + `TGATHER` | `tgather+ tconcat(acc, segment, offset)` | vscatter at computed offsets + byte-count accumulator |
+| Unique Dedup | `TUNIQUE` | `tunique(dst_tile, sorted_src_tile)` | vldas+vldus for shifted predecessor load + vcmp_ne + vsqz + vstur/vstar compact stream |
+| GatherConcat | `TCONCAT` + `TGATHER` | `tgather+ tconcat(acc, segment, offset)` | TINSERT (vstus+vstas) at accumulator offset + byte-count accumulator loop |
 
 **Principle**: The pto.vmi programmer writes `TEXTRACT(dst, src, row, col, shape)` and the compiler decides:
 - If `col * sizeof(T) % 32 == 0` → use `vlds+vsts` (aligned path)
@@ -363,23 +446,31 @@ Reduce output (TQUANT AbsReduceMax):
       → vsts(vreg, dstAddr, dstRowOff, distValue, preg)  [predicated aligned]
 ```
 
-### Decision 4: Squeeze-Stream vs Scatter for Gather
+### Decision 4: Static-Count vs Dynamic-Count Compact Write
 
 ```
-TGATHER(dst, src, mask):
-  ├─ GATHER_COL (column gather, fixed stride)
-  │   → vlds + vsts with predicate mask  [aligned gather]
-  └─ GATHER_ROW (row gather, variable selection)
-      → sprclr + vlds + pand + vsqz + vstur per chunk + vstar  [squeeze-stream]
+Compact output write:
+  ├─ Count known at compile time (e.g. reduce-max groupsPerRow)
+  │   → vstus(ureg, knownCount, vreg, writePtr, POST_UPDATE) per row
+  │     + padding vstus + vstas flush  [TQuant pattern — Use Case 3]
+  └─ Count unknown at compile time (e.g. unique dedup, predicate-based gather)
+      │   → vsqz(dstReg, srcReg, mask, MODE_STORED) to compact predicate-active lanes
+      │   → vstur(ureg, dstReg, dstPtr, POST_UPDATE) per chunk to stream compacted output
+      │   → vstar(ureg, dstPtr) to finalize  [Unique dedup / TGather pattern — Use Case 4]
+      └─ For the shifted predecessor load in unique dedup:
+          → vldas(ureg_shift, shiftedPtr) + vldus(vreg_prev, ureg_shift, shiftedPtr)
+            (1-element shift produces misaligned address — Use Case 1 pattern)
 ```
 
-### Decision 5: Concat at Computed Offset
+### Decision 5: Concat at Accumulator Offset (TInsert)
 
 ```
-TCONCAT_IMPL(acc, segment0, segment1, offset0, offset1):
+TCONCAT_IMPL(acc, segment0, segment1, offset):
   → vlds + vsts for segment0 (aligned, at offset 0)
   → mem_bar(VST_VLD)
-  → vlds + vci + vscatter for segment1 (at computed offset)
+  → TINSERT for segment1 at accumulator offset (same as Use Case 2):
+      ├─ offset * sizeof(T) % 32 == 0  → vlds + vsts with predicate  [aligned]
+      └─ offset * sizeof(T) % 32 != 0  → vlds + vstus + vstas per row  [unaligned TInsert]
 ```
 
 ---
@@ -395,6 +486,8 @@ TCONCAT_IMPL(acc, segment0, segment1, offset0, offset1):
 | `vsqz` | Squeeze Compact | `(dstReg, srcReg, mask, MODE_STORED)` | Pack predicate-active lanes to front of dstReg |
 | `vstur` | Squeeze-Store Stream | `(ureg, vreg, pdst, POST_UPDATE)` | Write squeezed vreg to UB via UnalignReg, advance |
 | `vstar` | Squeeze-Store Finalize | `(ureg, pdst)` | Finalize the squeeze-stream output |
-| `vscatter` | Scatter Write | `(vreg, basePtr, indexVec, preg)` | Write vreg elements to UB at positions computed by index vector |
-| `vci` | Vector Index Generate | `(vreg_idx, startVal, INC_ORDER)` | Generate sequential byte-offset indices for scatter |
+| `vcmp_ne` | Vector Compare NE | `(dstMask, src0, src1, preg)` | Element-wise not-equal comparison, result as predicate mask |
+| `vcmp_eq` | Vector Compare EQ | `(dstMask, src0, src1, preg)` | Element-wise equal comparison, result as predicate mask |
+| `vcmp_gt` | Vector Compare GT | `(dstMask, src0, src1, preg)` | Element-wise greater-than comparison, result as predicate mask |
+| `por` | Predicate OR | `(dst, src0, src1)` | Union of two predicate masks |
 | `sprclr` | Address Register Clear | `(sprValue)` | Clear scalar address register for streaming position reset |
